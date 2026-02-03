@@ -1,0 +1,1766 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>waves</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#000; }
+    canvas { display:block; width:100vw; height:100vh; }
+    #hint{
+      position:fixed; inset:0;
+      display:flex; align-items:center; justify-content:center;
+      font:13px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      color:rgba(255,255,255,0.75);
+      pointer-events:none; z-index:9;
+    }
+    #ui{
+      position:fixed; left:12px; top:12px;
+      display:none; gap:10px; align-items:center;
+      font:12px/1.2 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      color:rgba(255,255,255,0.92);
+      user-select:none; z-index:10;
+      mix-blend-mode:screen;
+    }
+    #ui button{
+      background:rgba(255,255,255,0.10);
+      color:rgba(255,255,255,0.95);
+      border:1px solid rgba(255,255,255,0.20);
+      padding:7px 10px;
+      border-radius:12px;
+      cursor:pointer;
+      backdrop-filter:blur(6px);
+      -webkit-backdrop-filter:blur(6px);
+    }
+    #ui button:hover{ background:rgba(255,255,255,0.18); }
+    #pill{
+      padding:7px 10px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,0.14);
+      background:rgba(0,0,0,0.22);
+      max-width:72vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    }
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="hint">Click / tap to start</div>
+  <div id="ui">
+    <button id="muteBtn" type="button">Mute</button>
+    <button id="fsBtn" type="button">Fullscreen</button>
+    <button id="nextBtn" type="button">Next</button>
+    <button id="randBtn" type="button">Random</button>
+    <span id="pill"></span>
+  </div>
+
+<script type="module">
+import * as THREE from "three";
+
+/* =========================
+   helpers
+========================= */
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp=(a,b,t)=>a+(b-a)*t;
+
+// log interpolation: a * (b/a)^t
+const logLerp = (a,b,t) => a * Math.pow(b/a, clamp(t,0,1));
+
+// log-ish mapping for “felt across the axis”
+function logMap01(x, k=8.0){
+  return Math.log(1 + k*clamp(x,0,1)) / Math.log(1 + k);
+}
+
+// expo mapping 0..1 -> a..b
+function expMap(x, a, b, p=2.2){
+  const t = Math.pow(clamp(x,0,1), p);
+  return a + (b-a)*t;
+}
+
+// deterministic seed
+function hash32(str){
+  let h = 2166136261 >>> 0;
+  for(let i=0;i<str.length;i++){
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h>>>0;
+}
+function mulberry32(seed){
+  let t = seed>>>0;
+  return function(){
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const pick = (rng, arr) => arr[Math.floor(rng()*arr.length)];
+const rndi = (rng, a,b) => Math.floor(lerp(a,b+1,rng()));
+
+// soft clip waveshaper (safety for feedback-y things)
+function makeSoftClipper(ctx, drive=1.6){
+  const ws = ctx.createWaveShaper();
+  const N = 2048;
+  const curve = new Float32Array(N);
+  for(let i=0;i<N;i++){
+    const x = (i/(N-1))*2 - 1;
+    curve[i] = Math.tanh(x * drive);
+  }
+  ws.curve = curve;
+  ws.oversample = "4x";
+  return ws;
+}
+
+/* =========================
+   pointer (normalized)
+========================= */
+const pointer = {
+  started:false,
+  held:false,
+  x:0.5, y:0.5,
+  px:0.5, py:0.5,
+  vx:0, vy:0,
+  lastMove: performance.now()
+};
+
+function updatePointerFromEvent(e){
+  const now = performance.now();
+  const clientX = (e.touches && e.touches[0]) ? e.touches[0].clientX : e.clientX;
+  const clientY = (e.touches && e.touches[0]) ? e.touches[0].clientY : e.clientY;
+
+  const nx = clamp(clientX / window.innerWidth, 0, 1);
+  const ny = clamp(clientY / window.innerHeight, 0, 1);
+
+  const dt = Math.max(1, now - pointer.lastMove);
+  pointer.vx = pointer.vx*0.78 + ((nx-pointer.x)/dt)*0.22;
+  pointer.vy = pointer.vy*0.78 + ((ny-pointer.y)/dt)*0.22;
+
+  pointer.px = pointer.x; pointer.py = pointer.y;
+  pointer.x = nx; pointer.y = ny;
+  pointer.lastMove = now;
+}
+
+/* =========================
+   UI
+========================= */
+const hint = document.getElementById("hint");
+const ui = document.getElementById("ui");
+const pill = document.getElementById("pill");
+const muteBtn = document.getElementById("muteBtn");
+const fsBtn = document.getElementById("fsBtn");
+const nextBtn = document.getElementById("nextBtn");
+const randBtn = document.getElementById("randBtn");
+
+/* =========================
+   25 deterministic “instrument” presets
+========================= */
+
+const PRESETS = [
+  // 0–1 leads (clean/melodic)
+  {name:"lead · clean triangle", kind:"sustain", osc:"triangle", base:55, oct:7.5, pitchPow:1.9, fxK:8,  env:{a:0.006,d:0.05,s:0.85,r:0.30}, fx:{rev:0.30, del:0.20, ph:0.20}, del:{min:0.09,max:0.55, fbMax:0.55}},
+  {name:"lead · bright saw + phaser", kind:"sustain", osc:"sawtooth", base:80, oct:7.0, pitchPow:1.6, fxK:7, env:{a:0.01,d:0.08,s:0.70,r:0.45}, fx:{rev:0.18, del:0.10, ph:0.55}, del:{min:0.05,max:0.25, fbMax:0.35}},
+
+  // 2–4 pads (lush)
+  {name:"pad · additive haze", kind:"pad_additive", osc:"sine", base:35, oct:6.5, pitchPow:1.7, fxK:10, env:{a:1.2,d:0.0,s:1.0,r:6.0}, fx:{rev:0.85, del:0.35, ph:0.12}, del:{min:0.22,max:2.7, fbMax:0.72}, add:{partials:20, rolloff:1.18}},
+  {name:"pad · fm glass", kind:"pad_fm", osc:"sine", base:55, oct:6.8, pitchPow:1.8, fxK:10, env:{a:0.8,d:0.0,s:1.0,r:7.5}, fx:{rev:0.78, del:0.20, ph:0.25}, del:{min:0.18,max:2.2, fbMax:0.65}, fm:{ratioA:1, ratioB:3, idxMax:600}},
+  {name:"pad · slow square choir", kind:"sustain", osc:"square", base:35, oct:6.2, pitchPow:2.1, fxK:11, env:{a:1.6,d:0.0,s:1.0,r:8.5}, fx:{rev:0.90, del:0.12, ph:0.10}, del:{min:0.35,max:3.0, fbMax:0.50}},
+
+  // 5 bass/mid stepped
+  {name:"bass · stepped mid", kind:"stepped", osc:"square", base:35, oct:5.2, pitchPow:1.9, fxK:7, env:{a:0.01,d:0.10,s:0.65,r:0.25}, fx:{rev:0.10, del:0.05, ph:0.05}, del:{min:0.05,max:0.18, fbMax:0.25}, step:{scale:[0,2,3,5,7,8,10], octMin:-1, octMax:1}},
+
+  // 6–7 drones (stable pitch, changing timbre)
+  {name:"drone · static pitch / moving color", kind:"drone", osc:"triangle", base:55, oct:0.0, pitchPow:1.0, fxK:9, env:{a:0.25,d:0.0,s:1.0,r:2.0}, fx:{rev:0.55, del:0.10, ph:0.65}, del:{min:0.08,max:0.22, fbMax:0.40}},
+  // PRESET 7: add chorus/vibrato (X = depth, Y = rate)
+  {name:"drone · ring ice", kind:"drone_ring", osc:"sine", base:80, oct:0.0, pitchPow:1.0, fxK:9, env:{a:0.15,d:0.0,s:1.0,r:3.5}, fx:{rev:0.35, del:0.00, ph:0.30}, del:{min:0.08,max:0.12, fbMax:0.00}, ring:{min:700,max:4200, depth:0.8},
+   chorus:{rateMin:0.25, rateMax:6.0, depthMsMin:1.2, depthMsMax:9.0, mix:0.55}},
+
+  // 8–12 percussive (repeat while held)
+  {name:"perc · kick", kind:"perc_kick", osc:"sine", base:55, oct:0.0, pitchPow:1.0, fxK:6, env:{a:0.001,d:0.08,s:0.0,r:0.18}, fx:{rev:0.08, del:0.00, ph:0.00}, rep:{minHz:2, maxHz:16, jitter:0.00}},
+  {name:"perc · snare/noise", kind:"perc_snare", osc:"noise", base:0, oct:0.0, pitchPow:1.0, fxK:6, env:{a:0.001,d:0.06,s:0.0,r:0.14}, fx:{rev:0.12, del:0.00, ph:0.20}, rep:{minHz:3, maxHz:22, jitter:0.10}},
+  // PRESET 10: add a bit of delay
+  {name:"perc · hat/glitch", kind:"perc_hat", osc:"noise", base:0, oct:0.0, pitchPow:1.0, fxK:6, env:{a:0.001,d:0.02,s:0.0,r:0.05},
+   fx:{rev:0.02, del:0.14, ph:0.40}, del:{min:0.04,max:0.22, fbMax:0.38},
+   rep:{minHz:6, maxHz:38, jitter:0.25}},
+  {name:"perc · metallic fm ticks", kind:"perc_metal", osc:"sine", base:110, oct:0.0, pitchPow:1.0, fxK:6, env:{a:0.001,d:0.03,s:0.0,r:0.08}, fx:{rev:0.06, del:0.00, ph:0.55}, rep:{minHz:4, maxHz:26, jitter:0.18}, fm:{ratioA:2, ratioB:9, idxMax:1200}},
+  {name:"perc · cuts/clicks", kind:"perc_clicks", osc:"click", base:0, oct:0.0, pitchPow:1.0, fxK:7, env:{a:0.001,d:0.01,s:0.0,r:0.02}, fx:{rev:0.00, del:0.00, ph:0.10}, rep:{minHz:8, maxHz:50, jitter:0.35}},
+
+  // 13–17 rhythmic textures (gated FM / ring / noise)
+  {name:"texture · fm gate", kind:"tex_fm_gate", osc:"sine", base:55, oct:7.2, pitchPow:1.9, fxK:9, env:{a:0.01,d:0.0,s:1.0,r:0.35}, fx:{rev:0.35, del:0.18, ph:0.25}, del:{min:0.02,max:0.20, fbMax:0.55}, gate:{minHz:2, maxHz:18}, fm:{ratioA:1, ratioB:8, idxMax:1600}},
+  // (safe little harmony/click seasoning for the “standing tone” feel)
+  {name:"texture · ring trem", kind:"tex_ring_gate", osc:"triangle", base:80, oct:6.6, pitchPow:1.7, fxK:8, env:{a:0.01,d:0.0,s:1.0,r:0.45}, fx:{rev:0.25, del:0.12, ph:0.30}, del:{min:0.08,max:0.40, fbMax:0.40}, gate:{minHz:1, maxHz:12}, ring:{min:80,max:2600, depth:0.95},
+   harmony:{every:4, mult:1.5}, extraClicks:true},
+  {name:"texture · noise clouds", kind:"tex_noise", osc:"noise", base:0, oct:0.0, pitchPow:1.0, fxK:10, env:{a:0.08,d:0.0,s:1.0,r:2.0}, fx:{rev:0.70, del:0.10, ph:0.10}, del:{min:0.12,max:0.90, fbMax:0.55}, gate:{minHz:0.5, maxHz:6}, extraClicks:true},
+  // PRESET 16: feedback safety (was too hot)
+  {name:"texture · stutter dub", kind:"tex_stutter_dub", osc:"sawtooth", base:55, oct:7.0, pitchPow:2.0, fxK:9, env:{a:0.005,d:0.0,s:1.0,r:0.40},
+   fx:{rev:0.35, del:0.55, ph:0.10}, del:{min:0.04,max:3.0, fbMax:0.82}, gate:{minHz:3, maxHz:24}, safeDelayFb:true},
+  // PRESET 17: louder clicks + extra very high clicks + standing tone >= 3000Hz
+  {name:"texture · ikeda cold", kind:"ikeda", osc:"sine", base:110, oct:8.0, pitchPow:2.3, fxK:6, env:{a:0.001,d:0.0,s:1.0,r:0.03}, fx:{rev:0.00, del:0.00, ph:0.00}, gate:{minHz:6, maxHz:45},
+   ikeda:{toneMin:3000, toneMax:10000, clickBoost:1.35, hiClickEvery:3}},
+
+  // 18–20 karplus/string-ish (true loop, 3 presets minimum) — feedback made SAFE
+  {name:"karplus · nylon", kind:"karplus", osc:"noise", base:55, oct:4.0, pitchPow:1.8, fxK:8, env:{a:0.0,d:0.0,s:1.0,r:0.0},
+   karp:{dampMin:1400, dampMax:5200, fbMin:0.90, fbMax:0.965, detune:0.002}, rep:{minHz:0.7, maxHz:8, jitter:0.05}, fx:{rev:0.20, del:0.00, ph:0.12}},
+  {name:"karplus · bright", kind:"karplus", osc:"noise", base:80, oct:4.3, pitchPow:1.6, fxK:8, env:{a:0.0,d:0.0,s:1.0,r:0.0},
+   karp:{dampMin:2200, dampMax:8000, fbMin:0.905, fbMax:0.972, detune:0.004}, rep:{minHz:1.0, maxHz:12, jitter:0.10}, fx:{rev:0.12, del:0.00, ph:0.20}},
+  {name:"karplus · noisy wood", kind:"karplus", osc:"noise", base:35, oct:4.1, pitchPow:2.0, fxK:9, env:{a:0.0,d:0.0,s:1.0,r:0.0},
+   karp:{dampMin:900, dampMax:3600, fbMin:0.89, fbMax:0.960, detune:0.006}, rep:{minHz:0.6, maxHz:10, jitter:0.18}, fx:{rev:0.25, del:0.00, ph:0.35}},
+
+  // 21–22 long-delay dub/ambient (audible)
+  {name:"dub · long echoes", kind:"sustain", osc:"triangle", base:55, oct:7.0, pitchPow:1.8, fxK:10, env:{a:0.03,d:0.05,s:0.85,r:1.0}, fx:{rev:0.45, del:0.78, ph:0.10}, del:{min:0.20,max:3.0, fbMax:0.97}},
+  {name:"dub · smeared tape", kind:"pad_fm", osc:"sine", base:35, oct:6.5, pitchPow:1.7, fxK:10, env:{a:0.25,d:0.0,s:1.0,r:4.5}, fx:{rev:0.65, del:0.70, ph:0.18}, del:{min:0.12,max:3.0, fbMax:0.96}, fm:{ratioA:0.5, ratioB:4, idxMax:500}},
+
+  // 23 risset glissando “always rising” (glide up longer + more oscs; stays on while held)
+  {name:"risset · endless rise", kind:"risset", osc:"sine", base:35, oct:6.8, pitchPow:1.6, fxK:9, env:{a:0.08,d:0.0,s:1.0,r:1.2},
+   fx:{rev:0.35, del:0.12, ph:0.10}, del:{min:0.05,max:0.30, fbMax:0.45},
+   ris:{voices:14, spanOct:3.2, speed:0.037}},
+
+  // 24 arpeggio/chord — add another octave up
+  {name:"arp · stepped chords", kind:"arp", osc:"sawtooth", base:55, oct:7.2, pitchPow:1.8, fxK:8, env:{a:0.01,d:0.0,s:1.0,r:0.35},
+   fx:{rev:0.28, del:0.20, ph:0.18}, del:{min:0.06,max:0.55, fbMax:0.55}, arp:{len:8, rateMin:2, rateMax:12, octaveUp:true}}
+];
+
+// simple visual archetypes, deterministic per preset
+function makeVisual(presetId){
+  const rng = mulberry32(hash32("vis::v5::"+presetId));
+  const hueA = (rndi(rng,0,359) + presetId*29) % 360;
+  const hueB = (hueA + rndi(rng,70,250)) % 360;
+  const p = PRESETS[presetId];
+
+  const kalei = (p.kind==="ikeda") ? 0 : (p.kind.startsWith("perc_") ? rndi(rng,0,2) : rndi(rng,0,3));
+  const mirror = (p.kind.startsWith("pad") || p.kind==="dub" || p.kind==="sustain") ? rndi(rng,0,2) : rndi(rng,0,3);
+
+  const grain = (p.kind==="ikeda" || p.kind==="perc_clicks") ? lerp(0.06,0.12,rng()) : lerp(0.0,0.06,rng());
+  const chroma = (p.kind.startsWith("tex_") || p.kind==="risset") ? lerp(0.004,0.018,rng()) : lerp(0.0,0.010,rng());
+
+  return {
+    id:presetId,
+    hueA, hueB,
+    sat: rndi(rng, 35, 100),
+    fb: lerp(0.970, 0.996, rng()),
+    mirror,
+    kalei,
+    slices: rndi(rng, 6, 20),
+    disp: lerp(0.004, 0.035, rng()),
+    curl: lerp(0.7, 3.2, rng()),
+    dots: (p.kind.startsWith("perc_") || p.kind.startsWith("tex_")) ? lerp(0.35, 0.95, rng()) : lerp(0.05, 0.30, rng()),
+    waves: (p.kind.startsWith("pad") || p.kind==="risset") ? lerp(1.3, 2.3, rng()) : lerp(0.4, 1.5, rng()),
+    lines: (p.kind==="ikeda") ? rndi(rng, 6, 14) : rndi(rng, 12, 48),
+    geo3d: (p.kind.startsWith("pad") || p.kind==="dub") ? rndi(rng, 1, 3) : rndi(rng, 0, 2),
+    vignette: lerp(0.0, 0.85, rng()),
+    grain,
+    chroma,
+    bgMode: rndi(rng, 0, 4),
+    pixelate: (p.kind==="ikeda" || p.kind==="perc_clicks") ? lerp(0.0, 0.06, rng()) : 0.0
+  };
+}
+
+const VIS = Array.from({length:25}, (_,i)=>makeVisual(i));
+let presetIndex = 0;
+let visual = VIS[presetIndex];
+let preset = PRESETS[presetIndex];
+
+/* =========================
+   Three.js feedback engine
+========================= */
+function dpr(){
+  const isMobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
+  const cap = isMobile ? 1.4 : 2.0;
+  return Math.max(1, Math.min(cap, window.devicePixelRatio||1));
+}
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference:"high-performance" });
+renderer.setPixelRatio(dpr());
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const ortho = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+const scene = new THREE.Scene();
+
+const quad = new THREE.Mesh(
+  new THREE.PlaneGeometry(2,2),
+  new THREE.ShaderMaterial({
+    uniforms: {
+      tPrev: { value: null },
+      tBrush:{ value: null },
+      res:   { value: new THREE.Vector2(1,1) },
+      time:  { value: 0 },
+      mouse: { value: new THREE.Vector2(0.5,0.5) },
+      vel:   { value: new THREE.Vector2(0,0) },
+
+      hueA: { value: 0 }, hueB: { value: 0 }, sat: { value: 90 },
+      fb: { value: 0.985 }, mirror:{value:0}, kalei:{value:0}, slices:{value:8},
+      disp:{value:0.01}, curl:{value:1.5},
+      dots:{value:0.2}, waves:{value:1.0}, lines:{value:24},
+      geo3d:{value:1}, vignette:{value:0.4}, grain:{value:0.03}, chroma:{value:0.006}, bgMode:{value:0},
+      pixelate:{value:0.0}
+    },
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main(){ vUv = uv; gl_Position = vec4(position,1.0); }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D tPrev;
+      uniform sampler2D tBrush;
+      uniform vec2 res;
+      uniform float time;
+      uniform vec2 mouse;
+      uniform vec2 vel;
+
+      uniform float hueA, hueB, sat;
+      uniform float fb, mirror, kalei, disp, curl, dots, waves, vignette, grain, chroma;
+      uniform float slices;
+      uniform float lines;
+      uniform float geo3d;
+      uniform float bgMode;
+      uniform float pixelate;
+
+      float hash21(vec2 p){
+        p = fract(p*vec2(123.34, 456.21));
+        p += dot(p, p+45.32);
+        return fract(p.x*p.y);
+      }
+      float noise(vec2 p){
+        vec2 i=floor(p), f=fract(p);
+        float a=hash21(i);
+        float b=hash21(i+vec2(1,0));
+        float c=hash21(i+vec2(0,1));
+        float d=hash21(i+vec2(1,1));
+        vec2 u=f*f*(3.0-2.0*f);
+        return mix(mix(a,b,u.x), mix(c,d,u.x), u.y);
+      }
+      vec2 curlNoise(vec2 p){
+        float e=0.0025;
+        float n1=noise(p+vec2(0.0,e));
+        float n2=noise(p+vec2(0.0,-e));
+        float n3=noise(p+vec2(e,0.0));
+        float n4=noise(p+vec2(-e,0.0));
+        float dx=(n1-n2)/(2.0*e);
+        float dy=(n3-n4)/(2.0*e);
+        return vec2(dx, -dy);
+      }
+      vec3 hsl2rgb(vec3 c){
+        vec3 rgb = clamp(abs(mod(c.x*6.0 + vec3(0,4,2), 6.0)-3.0)-1.0, 0.0, 1.0);
+        return c.z + c.y*(rgb-0.5)*(1.0-abs(2.0*c.z-1.0));
+      }
+      vec2 foldUv(vec2 uv){
+        vec2 p = uv*2.0 - 1.0;
+        if(mirror > 0.5){
+          if(mirror < 1.5) p.x = abs(p.x);
+          else if(mirror < 2.5) p.y = abs(p.y);
+          else { p.x = abs(p.x); p.y = abs(p.y); }
+        }
+        if(kalei > 0.5){
+          float a = atan(p.y, p.x);
+          float r = length(p);
+          float k = max(3.0, slices);
+          float seg = 6.28318530718 / k;
+          a = mod(a, seg);
+          a = abs(a - seg*0.5);
+          p = vec2(cos(a), sin(a)) * r;
+        }
+        return p*0.5 + 0.5;
+      }
+
+      float wireGeom(vec2 uv, float t){
+        vec2 p = uv*2.0-1.0;
+        float z = 0.35 + 0.25*sin(t*0.7);
+        p *= 1.0 + 0.35*sin(t*0.35);
+        float a = abs(abs(p.x)-z);
+        float b = abs(abs(p.y)-z);
+        float e = min(a,b);
+        return smoothstep(0.02, 0.0, e);
+      }
+
+      void main(){
+        vec2 uv=vUv;
+
+        if(pixelate > 0.0001){
+          float px = max(1.0, floor(res.x * pixelate));
+          float py = max(1.0, floor(res.y * pixelate));
+          uv = vec2(floor(uv.x*px)/px, floor(uv.y*py)/py);
+        }
+
+        vec2 fuv=foldUv(uv);
+        vec2 p=(fuv-0.5)*vec2(res.x/res.y,1.0);
+
+        vec2 c=curlNoise(p*curl + time*0.05);
+        vec2 dv=vec2(vel.x, -vel.y)*18.0;
+        vec2 duv=c*disp + dv*disp*0.001;
+
+        vec2 uvR = foldUv(uv + duv + vec2(chroma,0.0));
+        vec2 uvG = foldUv(uv + duv);
+        vec2 uvB = foldUv(uv + duv - vec2(chroma,0.0));
+
+        vec3 prev;
+        prev.r = texture2D(tPrev, uvR).r;
+        prev.g = texture2D(tPrev, uvG).g;
+        prev.b = texture2D(tPrev, uvB).b;
+
+        float bg;
+        if(bgMode < 0.5) bg = 0.02 + 0.02*noise(p*2.0+time*0.02);
+        else if(bgMode < 1.5) bg = 0.02 + 0.05*noise(p*5.0+time*0.04);
+        else if(bgMode < 2.5) bg = 0.012 + 0.018*sin(p.x*3.0+time*0.2)*sin(p.y*2.0-time*0.15);
+        else if(bgMode < 3.5) bg = 0.02 + 0.02*noise(p*12.0 + time*0.12);
+        else bg = 0.015 + 0.03*noise(p*1.2 + time*0.01);
+
+        float wf=0.0;
+        float L=max(6.0, lines);
+        for(float i=0.0;i<56.0;i++){
+          if(i>=L) break;
+          float k=i/L;
+          float a=(k*6.28318)+time*0.12;
+          float w=sin((p.x*cos(a)+p.y*sin(a))*3.5 + time*0.8 + k*10.0);
+          wf += smoothstep(0.02, 0.0, abs(w)*0.06) * (0.25+0.75*k);
+        }
+        wf *= 0.18 * waves;
+
+        float dn=noise(p*vec2(70.0,50.0)+time*0.3);
+        float dp=smoothstep(0.985,1.0,dn)*dots;
+
+        float brush=texture2D(tBrush, uv).r;
+
+        float g3=0.0;
+        if(geo3d > 0.5){
+          g3 = wireGeom(fuv, time*0.8) * (0.10*geo3d);
+        }
+
+        float h = mix(hueA/360.0, hueB/360.0, noise(p*1.2 + time*0.03));
+        float l = 0.16 + 0.22*wf + 0.12*dp + 0.18*brush + g3 + bg;
+        float s = sat/100.0;
+
+        vec3 base = hsl2rgb(vec3(h, s, clamp(l, 0.02, 0.94)));
+
+        vec3 col = prev * fb;
+        col = mix(col, base, 0.10 + 0.50*brush + 0.22*dp + 0.18*wf);
+
+        if(kalei > 1.5){
+          col = abs(col - base*0.95) + col*0.72;
+          col = pow(col, vec3(0.92));
+        }
+
+        if(vignette > 0.01){
+          vec2 q = uv - 0.5;
+          float v = smoothstep(0.9, 0.25, dot(q,q)*2.2);
+          col *= mix(1.0, v, vignette);
+        }
+
+        if(grain > 0.0001){
+          float g = hash21(uv*res + time*60.0) - 0.5;
+          col += g*grain;
+        }
+
+        gl_FragColor = vec4(clamp(col,0.0,1.0),1.0);
+      }
+    `
+  })
+);
+scene.add(quad);
+
+let rtA, rtB;
+function makeRT(w,h){
+  return new THREE.WebGLRenderTarget(w,h,{
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
+    depthBuffer:false,
+    stencilBuffer:false
+  });
+}
+function resizeGL(){
+  const W = Math.floor(window.innerWidth * dpr());
+  const H = Math.floor(window.innerHeight * dpr());
+  renderer.setPixelRatio(dpr());
+  renderer.setSize(window.innerWidth, window.innerHeight);
+
+  if(rtA) rtA.dispose();
+  if(rtB) rtB.dispose();
+  rtA = makeRT(W,H);
+  rtB = makeRT(W,H);
+
+  quad.material.uniforms.res.value.set(W,H);
+
+  renderer.setRenderTarget(rtA); renderer.clear();
+  renderer.setRenderTarget(rtB); renderer.clear();
+  renderer.setRenderTarget(null);
+}
+window.addEventListener("resize", resizeGL);
+resizeGL();
+
+/* =========================
+   Brush canvas (2D -> texture)
+========================= */
+const brushC = document.createElement("canvas");
+const brushCtx = brushC.getContext("2d");
+function resizeBrush(){
+  brushC.width = Math.floor(window.innerWidth * dpr());
+  brushC.height= Math.floor(window.innerHeight * dpr());
+  brushCtx.fillStyle="black";
+  brushCtx.fillRect(0,0,brushC.width, brushC.height);
+}
+resizeBrush();
+window.addEventListener("resize", resizeBrush);
+
+const brushTex = new THREE.CanvasTexture(brushC);
+brushTex.minFilter = THREE.LinearFilter;
+brushTex.magFilter = THREE.LinearFilter;
+
+let brushRng = mulberry32(hash32("brush::v5::"+presetIndex));
+
+function drawBrushFrame(){
+  const W=brushC.width, H=brushC.height;
+
+  brushCtx.globalCompositeOperation="source-over";
+  brushCtx.fillStyle="rgba(0,0,0,0.085)";
+  brushCtx.fillRect(0,0,W,H);
+
+  const x = pointer.x * W;
+  const y = pointer.y * H;
+  const speed = Math.hypot(pointer.vx, pointer.vy);
+  const energy = clamp(speed * 1200.0, 0, 1);
+
+  const dotCount = Math.floor(lerp(2, 26, energy) * lerp(0.6, 1.8, visual.dots));
+  brushCtx.globalCompositeOperation="lighter";
+  brushCtx.fillStyle = `rgba(255,255,255,${lerp(0.04,0.18,energy)})`;
+  for(let i=0;i<dotCount;i++){
+    const a = brushRng()*Math.PI*2;
+    const r = Math.pow(brushRng(), 0.35) * lerp(3, 130, energy);
+    brushCtx.beginPath();
+    brushCtx.arc(x + Math.cos(a)*r, y + Math.sin(a)*r, lerp(1.0, 5.2, brushRng())*(0.6+energy), 0, Math.PI*2);
+    brushCtx.fill();
+  }
+
+  const strokes = Math.floor(lerp(1, 7, energy) * lerp(0.5, 1.8, visual.waves));
+  brushCtx.strokeStyle = `rgba(255,255,255,${lerp(0.025,0.12,energy)})`;
+  brushCtx.lineWidth = lerp(0.9, 3.6, energy);
+  for(let k=0;k<strokes;k++){
+    const len = lerp(40, 300, energy);
+    const ang = Math.atan2(pointer.vy, pointer.vx) + (brushRng()*2-1)*1.2;
+    brushCtx.beginPath();
+    const steps = 18;
+    for(let i=0;i<=steps;i++){
+      const t = i/steps;
+      const wob = Math.sin(t*6.28318*lerp(1.4, 4.2, brushRng()) + performance.now()*0.002 + k)*lerp(0, 48, energy);
+      const px = x + Math.cos(ang)*len*(t-0.5) - Math.sin(ang)*wob;
+      const py = y + Math.sin(ang)*len*(t-0.5) + Math.cos(ang)*wob;
+      if(i===0) brushCtx.moveTo(px,py); else brushCtx.lineTo(px,py);
+    }
+    brushCtx.stroke();
+  }
+
+  brushCtx.globalCompositeOperation="source-over";
+  brushTex.needsUpdate = true;
+}
+
+/* =========================
+   Apply visual preset
+========================= */
+function applyVisual(){
+  const u = quad.material.uniforms;
+  u.hueA.value = visual.hueA;
+  u.hueB.value = visual.hueB;
+  u.sat.value  = visual.sat;
+  u.fb.value   = visual.fb;
+
+  u.mirror.value = visual.mirror;
+  u.kalei.value  = visual.kalei;
+  u.slices.value = visual.slices;
+
+  u.disp.value   = visual.disp;
+  u.curl.value   = visual.curl;
+  u.dots.value   = visual.dots;
+  u.waves.value  = visual.waves;
+  u.lines.value  = visual.lines;
+  u.geo3d.value  = visual.geo3d;
+
+  u.vignette.value = visual.vignette;
+  u.grain.value  = visual.grain;
+  u.chroma.value = visual.chroma;
+  u.bgMode.value = visual.bgMode;
+  u.pixelate.value = visual.pixelate;
+}
+
+/* =========================
+   Audio engine
+========================= */
+let ac=null;
+let muted=false;
+
+let audioArmed=false;
+let fadeTriggered=false;
+
+// master
+let master, masterGate, comp;
+
+// fx buses
+let dryBus, delBus, revBus, phBus;
+
+// global FX nodes
+let fxDelay, fxFb, fxHp, fxLp;
+let revConv, revHp, revLp;
+let phaserIn, phaserMix, phaserFb, phaserChain=[];
+
+// current instrument nodes
+let voice = null;
+let voiceGain = null;
+let noiseNode = null;
+
+// scheduler
+const sched = {
+  tickMs: 25,
+  lookahead: 0.12,
+  nextEventTime: 0,
+  step: 0,
+  timer: null,
+  rng: null
+};
+
+// inactivity fade (do NOT fade while held)
+function maybeTriggerFade(nowMs){
+  const inactiveMs = nowMs - pointer.lastMove;
+  if(audioArmed && !pointer.held && inactiveMs > 140){
+    if(!fadeTriggered){
+      fadeTriggered = true;
+      audioArmed = false;
+      if(ac){
+        const t = ac.currentTime;
+        masterGate.gain.cancelScheduledValues(t);
+        masterGate.gain.setValueAtTime(masterGate.gain.value, t);
+        masterGate.gain.linearRampToValueAtTime(0.0, t + 5.0);
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+function makeImpulseResponse(ctx, seconds, decay, seed){
+  const rng = mulberry32(seed>>>0);
+  const rate = ctx.sampleRate;
+  const len = Math.max(1, Math.floor(seconds * rate));
+  const buf = ctx.createBuffer(2, len, rate);
+  for(let ch=0; ch<2; ch++){
+    const d = buf.getChannelData(ch);
+    for(let i=0;i<len;i++){
+      const t = i/len;
+      d[i] = (rng()*2 - 1) * Math.pow(1 - t, decay);
+    }
+  }
+  return buf;
+}
+
+function startAudio(){
+  if(ac) return;
+  ac = new (window.AudioContext||window.webkitAudioContext)();
+
+  master = ac.createGain();
+  master.gain.value = 0.105;
+
+  masterGate = ac.createGain();
+  masterGate.gain.value = 0.0;
+
+  comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -18;
+  comp.knee.value = 18;
+  comp.ratio.value = 3.2;
+  comp.attack.value = 0.010;
+  comp.release.value = 0.22;
+
+  dryBus = ac.createGain(); dryBus.gain.value = 1.0;
+  delBus = ac.createGain(); delBus.gain.value = 0.0;
+  revBus = ac.createGain(); revBus.gain.value = 0.0;
+  phBus  = ac.createGain(); phBus.gain.value  = 0.0;
+
+  fxDelay = ac.createDelay(3.5);
+  fxFb = ac.createGain();
+  fxHp = ac.createBiquadFilter(); fxHp.type="highpass"; fxHp.frequency.value = 120;
+  fxLp = ac.createBiquadFilter(); fxLp.type="lowpass";  fxLp.frequency.value = 8200;
+
+  fxDelay.connect(fxHp);
+  fxHp.connect(fxLp);
+  fxLp.connect(fxFb);
+  fxFb.connect(fxDelay);
+  fxDelay.connect(delBus);
+
+  revConv = ac.createConvolver();
+  revHp = ac.createBiquadFilter(); revHp.type="highpass"; revHp.frequency.value = 180;
+  revLp = ac.createBiquadFilter(); revLp.type="lowpass";  revLp.frequency.value = 9000;
+  revConv.connect(revHp); revHp.connect(revLp); revLp.connect(revBus);
+
+  phaserMix = ac.createGain(); phaserMix.gain.value = 0.0;
+  phaserFb  = ac.createGain(); phaserFb.gain.value = 0.0;
+
+  dryBus.connect(masterGate);
+  delBus.connect(masterGate);
+  revBus.connect(masterGate);
+  phaserMix.connect(masterGate);
+
+  masterGate.connect(master);
+  master.connect(comp);
+  comp.connect(ac.destination);
+
+  buildPhaser(6);
+}
+
+function buildPhaser(stages){
+  try{ phaserMix.disconnect(); }catch(_){}
+  phaserChain.forEach(n=>{ try{n.disconnect();}catch(_){} });
+  phaserChain = [];
+
+  const input = ac.createGain();
+  let prev = input;
+  for(let i=0;i<stages;i++){
+    const ap = ac.createBiquadFilter();
+    ap.type = "allpass";
+    ap.frequency.value = 600;
+    ap.Q.value = 0.6;
+    prev.connect(ap);
+    prev = ap;
+    phaserChain.push(ap);
+  }
+  prev.connect(phaserFb);
+  phaserFb.connect(input);
+  prev.connect(phaserMix);
+  phaserIn = input;
+  return input;
+}
+
+function stopVoice(){
+  if(!ac) return;
+  if(sched.timer){ clearInterval(sched.timer); sched.timer=null; }
+  sched.nextEventTime = 0;
+  sched.step = 0;
+
+  try{
+    if(voice && voice.stopAll) voice.stopAll();
+  }catch(_){}
+  voice = null;
+
+  if(voiceGain){
+    try{ voiceGain.disconnect(); }catch(_){}
+  }
+  voiceGain = null;
+
+  if(noiseNode){
+    try{ noiseNode.disconnect(); }catch(_){}
+  }
+  noiseNode = null;
+}
+
+function setMuted(next){
+  muted = next;
+  muteBtn.textContent = muted ? "Unmute" : "Mute";
+  if(!ac) return;
+  const t = ac.currentTime;
+  masterGate.gain.cancelScheduledValues(t);
+  masterGate.gain.setTargetAtTime(muted ? 0.0 : masterGate.gain.value, t, 0.02);
+}
+
+/* =========================
+   instrument builders
+========================= */
+function makeNoiseSource(){
+  const buffer = ac.createBuffer(1, ac.sampleRate*1.0, ac.sampleRate);
+  const d = buffer.getChannelData(0);
+  const rng = mulberry32(hash32("noisebuf::v5"));
+  for(let i=0;i<d.length;i++) d[i] = rng()*2-1;
+  const src = ac.createBufferSource();
+  src.buffer = buffer;
+  src.loop = true;
+  return src;
+}
+
+function makeMainEnvelope(){
+  const g = ac.createGain();
+  g.gain.value = 0.0;
+  return g;
+}
+
+function applyEnv(gainParam, t, env, peak=1.0){
+  gainParam.cancelScheduledValues(t);
+  gainParam.setValueAtTime(gainParam.value, t);
+  gainParam.linearRampToValueAtTime(peak, t + Math.max(0.001, env.a));
+  if(env.d > 0){
+    gainParam.linearRampToValueAtTime(peak*env.s, t + env.a + env.d);
+  }else{
+    gainParam.setValueAtTime(peak*env.s, t + env.a);
+  }
+}
+
+function releaseEnv(gainParam, t, env){
+  gainParam.cancelScheduledValues(t);
+  gainParam.setValueAtTime(gainParam.value, t);
+  gainParam.linearRampToValueAtTime(0.0, t + Math.max(0.005, env.r));
+}
+
+function connectVoiceOut(node){
+  node.connect(dryBus);
+  node.connect(fxDelay);
+  node.connect(revConv);
+  node.connect(phaserIn);
+}
+
+/* -------- karplus: private loop -------- */
+function buildKarplus(){
+  const out = ac.createGain();
+  out.gain.value = 1.0;
+
+  const delay = ac.createDelay(0.12);
+  const fb = ac.createGain();
+  const damp = ac.createBiquadFilter(); damp.type="lowpass";
+  const hp   = ac.createBiquadFilter(); hp.type="highpass"; hp.frequency.value = 60;
+
+  // extra safety on output
+  const clip = makeSoftClipper(ac, 1.5);
+  const post = ac.createGain(); post.gain.value = 0.85;
+
+  delay.connect(damp);
+  damp.connect(fb);
+  fb.connect(delay);
+
+  damp.connect(hp);
+  hp.connect(clip);
+  clip.connect(post);
+  post.connect(out);
+
+  const inj = ac.createGain();
+  inj.connect(delay);
+
+  connectVoiceOut(out);
+
+  return {
+    out, delay, fb, damp, inj, clip, post,
+    stopAll(){
+      for(const n of [out,delay,fb,damp,inj,clip,post]){
+        try{ n.disconnect(); }catch(_){}
+      }
+    }
+  };
+}
+
+/* -------- sustain voice -------- */
+function buildSustain(oscType){
+  const osc = ac.createOscillator();
+  osc.type = oscType;
+  const g = makeMainEnvelope();
+  osc.connect(g);
+  connectVoiceOut(g);
+  osc.start();
+  return {
+    osc, g,
+    stopAll(){
+      try{ osc.stop(); }catch(_){}
+      try{ osc.disconnect(); }catch(_){}
+      try{ g.disconnect(); }catch(_){}
+    }
+  };
+}
+
+/* -------- dual-osc arp (for octave up) -------- */
+function buildArpDual(oscType){
+  const oscA = ac.createOscillator(); oscA.type = oscType;
+  const oscB = ac.createOscillator(); oscB.type = oscType;
+
+  const g = makeMainEnvelope();
+  const gB = ac.createGain(); gB.gain.value = 0.52;
+
+  oscA.connect(g);
+  oscB.connect(gB);
+  gB.connect(g);
+
+  connectVoiceOut(g);
+
+  oscA.start(); oscB.start();
+
+  return {
+    oscA, oscB, g,
+    stopAll(){
+      for(const o of [oscA, oscB]){ try{o.stop();}catch(_){} try{o.disconnect();}catch(_){} }
+      try{ gB.disconnect(); }catch(_){}
+      try{ g.disconnect(); }catch(_){}
+    }
+  };
+}
+
+/* -------- additive pad -------- */
+function buildAdditive(partials=16, rolloff=1.15){
+  const g = makeMainEnvelope();
+  connectVoiceOut(g);
+  const oscs = [];
+  for(let i=1;i<=partials;i++){
+    const o = ac.createOscillator();
+    o.type = "sine";
+    const og = ac.createGain();
+    og.gain.value = 1/Math.pow(i, rolloff);
+    o.connect(og);
+    og.connect(g);
+    o.start();
+    oscs.push(o);
+  }
+  return {
+    oscs, g,
+    stopAll(){
+      for(const o of oscs){ try{o.stop();}catch(_){} try{o.disconnect();}catch(_){} }
+      try{ g.disconnect(); }catch(_){}
+    }
+  };
+}
+
+/* -------- FM pad / texture -------- */
+function buildFM(){
+  const car = ac.createOscillator();
+  const mod = ac.createOscillator();
+  car.type = "sine";
+  mod.type = "sine";
+  const modGain = ac.createGain();
+  modGain.gain.value = 0.0;
+  mod.connect(modGain);
+  modGain.connect(car.frequency);
+
+  const g = makeMainEnvelope();
+  car.connect(g);
+  connectVoiceOut(g);
+
+  car.start(); mod.start();
+  return {
+    car, mod, modGain, g,
+    stopAll(){
+      for(const n of [car,mod]){ try{n.stop();}catch(_){} try{n.disconnect();}catch(_){} }
+      try{ modGain.disconnect(); }catch(_){}
+      try{ g.disconnect(); }catch(_){}
+    }
+  };
+}
+
+/* -------- ring voice (+ optional chorus/vibrato) -------- */
+function buildRing(oscType, presetRef=null){
+  const car = ac.createOscillator(); car.type = oscType;
+  const mod = ac.createOscillator(); mod.type = "sine";
+  const depth = ac.createGain(); depth.gain.value = 0.0;
+
+  const offset = ac.createConstantSource(); offset.offset.value = 0.5;
+  const shaper = ac.createGain(); shaper.gain.value = 0.5;
+
+  mod.connect(shaper);
+  shaper.connect(depth);
+
+  const sum = ac.createGain();
+  offset.connect(sum);
+  depth.connect(sum);
+
+  const vca = ac.createGain(); vca.gain.value = 1.0;
+  sum.connect(vca.gain);
+
+  const g = makeMainEnvelope();
+
+  // optional chorus block (preset 7)
+  let chorus = null;
+  let pre = vca;
+  if(presetRef && presetRef.chorus){
+    const mix = ac.createGain(); mix.gain.value = presetRef.chorus.mix ?? 0.5;
+    const dry = ac.createGain(); dry.gain.value = 1.0 - mix.gain.value;
+    const wet = ac.createGain(); wet.gain.value = mix.gain.value;
+
+    const chDelay = ac.createDelay(0.05);
+    chDelay.delayTime.value = (presetRef.chorus.depthMsMin ?? 2.0) / 1000;
+
+    const lfo = ac.createOscillator(); lfo.type="sine";
+    const lfoGain = ac.createGain(); lfoGain.gain.value = 0.0; // set in tick
+    lfo.connect(lfoGain);
+    lfoGain.connect(chDelay.delayTime);
+    lfo.start();
+
+    pre.connect(dry);
+    pre.connect(chDelay);
+    chDelay.connect(wet);
+
+    const sumMix = ac.createGain();
+    dry.connect(sumMix);
+    wet.connect(sumMix);
+
+    pre = sumMix;
+
+    chorus = {mix, dry, wet, chDelay, lfo, lfoGain};
+  }
+
+  car.connect(vca);
+  pre.connect(g);
+  connectVoiceOut(g);
+
+  offset.start();
+  car.start();
+  mod.start();
+
+  return {
+    car, mod, depth, g, chorus,
+    stopAll(){
+      for(const n of [car,mod]){ try{n.stop();}catch(_){} try{n.disconnect();}catch(_){} }
+      try{ depth.disconnect(); }catch(_){}
+      try{ g.disconnect(); }catch(_){}
+      if(chorus){
+        try{ chorus.lfo.stop(); }catch(_){}
+        for(const n of [chorus.mix,chorus.dry,chorus.wet,chorus.chDelay,chorus.lfo,chorus.lfoGain]){
+          try{ n.disconnect(); }catch(_){}
+        }
+      }
+    }
+  };
+}
+
+/* -------- event voice (kick/snare/hat/clicks/metal) -------- */
+function buildEventVoice(kind){
+  const src = makeNoiseSource();
+  const filt = ac.createBiquadFilter();
+  const g = ac.createGain();
+  g.gain.value = 0.0;
+
+  if(kind==="perc_hat"){
+    filt.type="highpass"; filt.frequency.value = 6000; filt.Q.value = 0.6;
+  }else if(kind==="perc_snare"){
+    filt.type="bandpass"; filt.frequency.value = 2200; filt.Q.value = 0.9;
+  }else if(kind==="perc_clicks"){
+    filt.type="highpass"; filt.frequency.value = 9500; filt.Q.value = 0.7;
+  }else{
+    filt.type="bandpass"; filt.frequency.value = 1800; filt.Q.value = 0.8;
+  }
+
+  src.connect(filt);
+  filt.connect(g);
+  connectVoiceOut(g);
+  src.start();
+
+  let metal = null;
+  if(kind==="perc_metal"){
+    metal = buildFM();
+  }
+
+  return {
+    src, filt, g, metal,
+    stopAll(){
+      try{ src.stop(); }catch(_){}
+      try{ src.disconnect(); }catch(_){}
+      try{ filt.disconnect(); }catch(_){}
+      try{ g.disconnect(); }catch(_){}
+      if(metal) metal.stopAll();
+    }
+  };
+}
+
+/* =========================
+   preset application (audio + visuals)
+========================= */
+function updatePill(){
+  pill.textContent = `preset ${presetIndex} · ${preset.name}`;
+}
+
+function buildPreset(){
+  if(!ac) return;
+  stopVoice();
+
+  sched.rng = mulberry32(hash32("sched::v5::" + presetIndex));
+
+  const long = preset.kind.startsWith("pad") || preset.kind==="dub" || preset.kind==="risset";
+  const sec = long ? 14.0 : (preset.kind.startsWith("tex_") ? 8.0 : 5.5);
+  const decay = long ? 7.5 : 4.0;
+  revConv.buffer = makeImpulseResponse(ac, sec, decay, hash32("ir::v5::"+presetIndex));
+
+  const phStages = (preset.kind==="ikeda") ? 4 : (preset.kind.startsWith("tex_") ? 8 : 6);
+  buildPhaser(phStages);
+
+  if(preset.kind==="pad_additive"){
+    voice = buildAdditive(preset.add.partials, preset.add.rolloff);
+    voiceGain = voice.g;
+  } else if(preset.kind==="pad_fm" || preset.kind==="tex_fm_gate" || preset.kind==="tex_stutter_dub"){
+    voice = buildFM();
+    voiceGain = voice.g;
+  } else if(preset.kind==="drone_ring" || preset.kind==="tex_ring_gate"){
+    voice = buildRing("sine", preset);
+    voiceGain = voice.g;
+  } else if(preset.kind==="karplus"){
+    voice = buildKarplus();
+    voiceGain = null;
+  } else if(preset.kind.startsWith("perc_")){
+    voice = buildEventVoice(preset.kind);
+    voiceGain = voice.g;
+  } else if(preset.kind==="risset"){
+    const g = makeMainEnvelope();
+    connectVoiceOut(g);
+    const voices = [];
+    const N = preset.ris.voices;
+    for(let i=0;i<N;i++){
+      const o = ac.createOscillator();
+      o.type = "sine";
+      const og = ac.createGain();
+      og.gain.value = 0.0;
+      o.connect(og); og.connect(g);
+      o.start();
+      voices.push({o, og});
+    }
+    voice = {
+      voices, g,
+      stopAll(){
+        for(const v of voices){ try{v.o.stop();}catch(_){} try{v.o.disconnect();}catch(_){} try{v.og.disconnect();}catch(_){} }
+        try{ g.disconnect(); }catch(_){}
+      }
+    };
+    voiceGain = g;
+  } else if(preset.kind==="ikeda"){
+    // add standing tone layer for preset 17 request
+    const toneOsc = ac.createOscillator();
+    toneOsc.type = "sine";
+    const toneGain = ac.createGain();
+    toneGain.gain.value = 0.0;
+    toneOsc.connect(toneGain);
+    connectVoiceOut(toneGain);
+    toneOsc.start();
+    voice = {
+      toneOsc, toneGain,
+      stopAll(){
+        try{ toneOsc.stop(); }catch(_){}
+        try{ toneOsc.disconnect(); }catch(_){}
+        try{ toneGain.disconnect(); }catch(_){}
+      }
+    };
+    voiceGain = null;
+  } else if(preset.kind==="arp"){
+    if(preset.arp && preset.arp.octaveUp){
+      voice = buildArpDual(preset.osc);
+      voiceGain = voice.g;
+    }else{
+      voice = buildSustain(preset.osc);
+      voiceGain = voice.g;
+    }
+  } else {
+    voice = buildSustain(preset.osc || "triangle");
+    voiceGain = voice.g;
+  }
+
+  delBus.gain.value = 0;
+  revBus.gain.value = 0;
+  phaserMix.gain.value = 0;
+  fxFb.gain.value = 0;
+
+  applyVisual();
+  updatePill();
+}
+
+/* =========================
+   scheduling (repeat while held)
+========================= */
+function scheduleLoop(){
+  if(!ac || muted) return;
+
+  const now = ac.currentTime;
+  if(sched.nextEventTime === 0) sched.nextEventTime = now + 0.02;
+
+  while(sched.nextEventTime < now + sched.lookahead){
+    scheduleEventAt(sched.nextEventTime, sched.step);
+    sched.step++;
+
+    const x = clamp(pointer.x,0,1);
+    const speed = clamp(Math.hypot(pointer.vx, pointer.vy) * 1200.0, 0, 1);
+
+    let hz = 0;
+    if(preset.kind.startsWith("perc_") || preset.kind.startsWith("tex_") || preset.kind==="ikeda"){
+      const minHz = (preset.rep && preset.rep.minHz) ? preset.rep.minHz : 2;
+      const maxHz = (preset.rep && preset.rep.maxHz) ? preset.rep.maxHz : 18;
+      hz = expMap(x, minHz, maxHz, 2.3) * lerp(0.9, 1.25, speed);
+    } else if(preset.kind==="karplus"){
+      const minHz = preset.rep.minHz, maxHz = preset.rep.maxHz;
+      hz = expMap(x, minHz, maxHz, 2.2) * lerp(0.9, 1.2, speed);
+    } else if(preset.kind==="arp"){
+      hz = expMap(x, preset.arp.rateMin, preset.arp.rateMax, 2.1);
+    } else {
+      hz = 0;
+    }
+
+    if(hz <= 0){
+      sched.nextEventTime = now + 0.25;
+      break;
+    }
+
+    const j = (preset.rep && preset.rep.jitter) ? preset.rep.jitter : 0;
+    const jr = (sched.rng ? (sched.rng()*2-1) : 0) * j;
+    const dt = Math.max(0.004, (1.0/hz) * (1.0 + jr));
+    sched.nextEventTime += dt;
+  }
+}
+
+function scheduleEventAt(t, step){
+  if(!pointer.held) return;
+
+  const x = clamp(pointer.x,0,1);
+  const y = clamp(pointer.y,0,1);
+
+  const xPitch = Math.pow(x, preset.pitchPow ?? 1.8);
+  let freq = preset.base * Math.pow(2, xPitch * (preset.oct ?? 7));
+
+  const depth = logMap01(1 - y, preset.fxK ?? 8);
+
+  if(preset.kind==="stepped"){
+    const s = preset.step.scale;
+    const st = s[Math.min(s.length-1, Math.floor(x * s.length))];
+    const oct = Math.floor(lerp(preset.step.octMin, preset.step.octMax, x));
+    freq = preset.base * Math.pow(2, (oct*12 + st)/12);
+  }
+
+  applyFXAt(t, depth);
+
+  if(preset.kind.startsWith("perc_")){
+    firePercAt(t, freq, depth, step);
+  } else if(preset.kind.startsWith("tex_") || preset.kind==="ikeda"){
+    fireTextureGateAt(t, freq, depth, step);
+  } else if(preset.kind==="karplus"){
+    fireKarplusAt(t, freq, depth, step);
+  } else if(preset.kind==="arp"){
+    fireArpAt(t, freq, depth, step);
+  }
+}
+
+function applyFXAt(t, depth){
+  const revMax = preset.fx.rev ?? 0.0;
+  const delMax = preset.fx.del ?? 0.0;
+  const phMax  = preset.fx.ph  ?? 0.0;
+
+  const duck = (revMax > 0.75 || delMax > 0.7) ? lerp(1.0, 0.78, depth) : 1.0;
+  dryBus.gain.setTargetAtTime(duck, t, 0.05);
+
+  revBus.gain.setTargetAtTime(revMax * depth, t, 0.10);
+  delBus.gain.setTargetAtTime(delMax * depth, t, 0.08);
+  phaserMix.gain.setTargetAtTime(phMax * depth, t, 0.08);
+  phaserFb.gain.setTargetAtTime(Math.min(0.65, phMax*0.75) * depth, t, 0.10);
+
+  if(preset.del){
+    const time = logLerp(preset.del.min, preset.del.max, 1 - depth);
+    fxDelay.delayTime.setTargetAtTime(clamp(time, 0.005, 3.3), t, 0.06);
+
+    const fbMax = preset.del.fbMax ?? 0.6;
+    const safetyCap = preset.safeDelayFb ? Math.min(0.82, fbMax) : fbMax;
+
+    fxFb.gain.setTargetAtTime(clamp(lerp(0.10, safetyCap, depth), 0.0, safetyCap), t, 0.08);
+
+    const inCombZone = (time < 0.05) && (preset.kind==="tex_stutter_dub" || preset.kind==="tex_fm_gate");
+    if(inCombZone){
+      fxFb.gain.setTargetAtTime(Math.min(safetyCap, lerp(0.45, Math.min(0.88, safetyCap), depth)), t, 0.04);
+      fxLp.frequency.setTargetAtTime(lerp(6000, 12000, depth), t, 0.05);
+    }else{
+      fxLp.frequency.setTargetAtTime(lerp(4200, 9800, depth), t, 0.12);
+    }
+  } else {
+    fxFb.gain.setTargetAtTime(0.0, t, 0.06);
+  }
+
+  const phCenter = lerp(180, 1800, depth);
+  phaserChain.forEach((ap, i)=>{
+    ap.frequency.setTargetAtTime(clamp(phCenter + i*lerp(40, 140, depth), 80, 6500), t, 0.06);
+  });
+
+  revHp.frequency.setTargetAtTime(lerp(140, 240, depth), t, 0.12);
+  revLp.frequency.setTargetAtTime(lerp(6500, 12000, depth), t, 0.12);
+}
+
+/* =========================
+   event firing
+========================= */
+function firePercAt(t, freq, depth, step){
+  if(!voice || !voice.g) return;
+
+  const g = voice.g.gain;
+  const env = preset.env;
+
+  let amp = 0.55;
+
+  if(preset.kind==="perc_kick"){
+    // stronger kick body
+    const o = ac.createOscillator();
+    const og = ac.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(120 + 55*depth, t);
+    o.frequency.exponentialRampToValueAtTime(36 + 10*depth, t + 0.10);
+    og.gain.setValueAtTime(0.0, t);
+    og.gain.linearRampToValueAtTime(1.22, t + 0.003);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+    o.connect(og);
+    connectVoiceOut(og);
+    o.start(t);
+    o.stop(t + 0.23);
+
+    // a bit more transient from noise bed
+    applyEnv(g, t, env, 0.42);
+    releaseEnv(g, t + 0.03, {r:0.08});
+    return;
+  }
+
+  if(preset.kind==="perc_clicks"){
+    amp = 0.25 + 0.25*depth;
+  } else if(preset.kind==="perc_hat"){
+    amp = 0.22 + 0.25*depth;
+    voice.filt.frequency.setTargetAtTime(lerp(6000, 11000, depth), t, 0.02);
+  } else if(preset.kind==="perc_snare"){
+    amp = 0.28 + 0.35*depth;
+    voice.filt.frequency.setTargetAtTime(lerp(1400, 4200, depth), t, 0.03);
+  } else if(preset.kind==="perc_metal"){
+    amp = 0.22 + 0.25*depth;
+    voice.filt.frequency.setTargetAtTime(lerp(1200, 8200, depth), t, 0.02);
+    if(voice.metal){
+      const f = clamp(freq, 120, 2200);
+      voice.metal.car.frequency.setValueAtTime(f, t);
+      const ratio = lerp(preset.fm.ratioA, preset.fm.ratioB, depth);
+      voice.metal.mod.frequency.setValueAtTime(f*ratio, t);
+      voice.metal.modGain.gain.setValueAtTime(preset.fm.idxMax * (0.2 + 0.8*depth), t);
+      voice.metal.g.gain.setValueAtTime(0.0, t);
+      voice.metal.g.gain.linearRampToValueAtTime(0.9, t + 0.002);
+      voice.metal.g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    }
+  }
+
+  applyEnv(g, t, env, amp);
+  releaseEnv(g, t + Math.max(0.002, env.d), {r: env.r});
+}
+
+function addHiClickAt(t, f=12000, peak=0.26, dur=0.018){
+  const o = ac.createOscillator();
+  const og = ac.createGain();
+  o.type = "sine";
+  o.frequency.setValueAtTime(clamp(f, 3000, 16000), t);
+  og.gain.setValueAtTime(0.0, t);
+  og.gain.linearRampToValueAtTime(peak, t + 0.001);
+  og.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(og);
+  connectVoiceOut(og);
+  o.start(t);
+  o.stop(t + dur + 0.01);
+}
+
+function fireTextureGateAt(t, freq, depth, step){
+  const env = preset.env;
+
+  if(preset.kind==="tex_noise"){
+    if(!voice || !voice.g) return;
+    const g = voice.g.gain;
+    const gateHz = expMap(clamp(pointer.x,0,1), preset.gate.minHz, preset.gate.maxHz, 2.0);
+    const ph = (step % 128) / 128;
+    const pulse = (Math.sin(ph * Math.PI*2 * gateHz * 0.25) > 0.1) ? 1 : 0;
+    const amp = lerp(0.10, 0.55, depth) * (pulse ? 1 : 0.35);
+    applyEnv(g, t, {a:0.01,d:0.0,s:1.0,r:env.r}, amp);
+
+    if(preset.extraClicks){
+      const hf = lerp(8000, 14000, depth);
+      addHiClickAt(t, hf, 0.16 + 0.10*depth, 0.014);
+    }
+    return;
+  }
+
+  if(preset.kind==="ikeda"){
+    // louder rhythmic clicks + extra very high clicks
+    const ib = preset.ikeda || {};
+    const boost = ib.clickBoost ?? 1.0;
+
+    const o = ac.createOscillator();
+    const og = ac.createGain();
+    o.type = "sine";
+    const f = clamp(freq, 2000, 12000);
+    o.frequency.setValueAtTime(f, t);
+    og.gain.setValueAtTime(0.0, t);
+    og.gain.linearRampToValueAtTime(0.55 * boost, t + 0.001);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.022);
+    o.connect(og);
+    connectVoiceOut(og);
+    o.start(t);
+    o.stop(t + 0.035);
+
+    const every = ib.hiClickEvery ?? 3;
+    if(step % every === 0){
+      const hf = lerp(12000, 16000, clamp(pointer.x,0,1));
+      addHiClickAt(t + 0.004, hf, 0.22, 0.016);
+      addHiClickAt(t + 0.010, hf*0.88, 0.15, 0.014);
+    }
+    return;
+  }
+
+  if(voiceGain){
+    const g = voiceGain.gain;
+    const x = clamp(pointer.x,0,1);
+
+    const gateHz = expMap(x, preset.gate.minHz, preset.gate.maxHz, 2.3);
+    const phase = (step % 256) / 256;
+    const lfo = Math.sin(phase * Math.PI*2 * gateHz * 0.12);
+
+    const hard = (preset.kind==="tex_stutter_dub") ? 1.0 : 0.5;
+    const gate = clamp(lerp(0.12, 1.0, (lfo*0.5+0.5)), 0, 1);
+    const amp = lerp(0.10, 0.85, depth) * lerp(1.0, gate, hard);
+
+    applyEnv(g, t, {a:0.003,d:0.0,s:1.0,r:env.r}, amp);
+
+    if(preset.kind==="tex_fm_gate" && voice.modGain){
+      const ratio = lerp(preset.fm.ratioA, preset.fm.ratioB, depth);
+      const c = clamp(freq, 40, 9000);
+      voice.car.frequency.setTargetAtTime(c, t, 0.02);
+      voice.mod.frequency.setTargetAtTime(c*ratio, t, 0.03);
+      voice.modGain.gain.setTargetAtTime(preset.fm.idxMax * depth, t, 0.04);
+    }
+    if(preset.kind==="tex_ring_gate" && voice.depth){
+      const rf = lerp(preset.ring.min, preset.ring.max, depth);
+      voice.car.frequency.setTargetAtTime(clamp(freq, 40, 12000), t, 0.02);
+      voice.mod.frequency.setTargetAtTime(rf, t, 0.03);
+      voice.depth.gain.setTargetAtTime(preset.ring.depth * depth, t, 0.04);
+
+      // harmony “once every few presses” (actually every few gated events)
+      if(preset.harmony && (step % preset.harmony.every === 0)){
+        addHiClickAt(t, 9000 + 5000*depth, 0.12 + 0.08*depth, 0.016);
+        const fH = clamp(freq * preset.harmony.mult, 60, 12000);
+        const ho = ac.createOscillator();
+        const hg = ac.createGain();
+        ho.type = "sine";
+        ho.frequency.setValueAtTime(fH, t);
+        hg.gain.setValueAtTime(0.0, t);
+        hg.gain.linearRampToValueAtTime(0.18 + 0.10*depth, t + 0.004);
+        hg.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+        ho.connect(hg);
+        connectVoiceOut(hg);
+        ho.start(t);
+        ho.stop(t + 0.26);
+      }
+    }
+
+    if(preset.extraClicks){
+      const hf = lerp(7500, 15000, depth);
+      addHiClickAt(t + 0.002, hf, 0.12 + 0.10*depth, 0.014);
+    }
+  }
+}
+
+function fireKarplusAt(t, freq, depth, step){
+  if(!voice || !voice.inj) return;
+
+  const f0 = clamp(freq, 35, 1000);
+  const dt = clamp(1.0 / f0, 0.0025, 0.060);
+  voice.delay.delayTime.setTargetAtTime(dt, t, 0.01);
+
+  const fb = lerp(preset.karp.fbMin, preset.karp.fbMax, depth);
+  voice.fb.gain.setTargetAtTime(clamp(fb, 0.0, 0.992), t, 0.02);
+
+  const dampHz = lerp(preset.karp.dampMin, preset.karp.dampMax, depth);
+  voice.damp.frequency.setTargetAtTime(clamp(dampHz, 200, 12000), t, 0.02);
+
+  const burst = ac.createBufferSource();
+  const len = Math.floor(ac.sampleRate * 0.008);
+  const buf = ac.createBuffer(1, len, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for(let i=0;i<len;i++){
+    const rr = sched.rng ? sched.rng() : 0.5;
+    d[i] = (rr*2-1) * (1 - i/len);
+  }
+  burst.buffer = buf;
+
+  const bg = ac.createGain();
+  bg.gain.setValueAtTime(0.0, t);
+  bg.gain.linearRampToValueAtTime(0.55, t + 0.001);
+  bg.gain.exponentialRampToValueAtTime(0.0001, t + 0.018);
+
+  burst.connect(bg);
+  bg.connect(voice.inj);
+
+  burst.start(t);
+  burst.stop(t + 0.03);
+}
+
+function fireArpAt(t, freq, depth, step){
+  if(!voice || !voiceGain) return;
+
+  const x = clamp(pointer.x,0,1);
+
+  const rng = mulberry32(hash32("arpseq::v5::"+presetIndex));
+  const seq = [];
+  for(let i=0;i<preset.arp.len;i++){
+    seq.push(Math.floor((rng()*10)));
+  }
+
+  const st = seq[step % seq.length];
+  const oct = Math.floor(lerp(-1, 2, x));
+  const f = preset.base * Math.pow(2, (oct*12 + st)/12);
+
+  if(voice.osc){
+    voice.osc.frequency.setTargetAtTime(clamp(f, 20, 14000), t, 0.01);
+  }else if(voice.oscA && voice.oscB){
+    voice.oscA.frequency.setTargetAtTime(clamp(f, 20, 14000), t, 0.01);
+    voice.oscB.frequency.setTargetAtTime(clamp(f*2.0, 40, 16000), t, 0.01);
+  }
+
+  const g = voiceGain.gain;
+  g.setValueAtTime(0.0, t);
+  g.linearRampToValueAtTime(0.85, t + 0.004);
+  g.exponentialRampToValueAtTime(0.0001, t + 0.18);
+}
+
+/* =========================
+   continuous mapping (sustain/pads/drones)
+========================= */
+function tickContinuous(nowMs){
+  if(!ac || muted) return;
+  if(maybeTriggerFade(nowMs)) return;
+  if(!audioArmed) return;
+
+  const x = clamp(pointer.x,0,1);
+  const y = clamp(pointer.y,0,1);
+  const depth = logMap01(1 - y, preset.fxK ?? 8);
+
+  const t = ac.currentTime;
+  masterGate.gain.setTargetAtTime(1.0, t, 0.03);
+
+  applyFXAt(t, depth);
+
+  if(preset.kind==="sustain" || preset.kind==="stepped" || preset.kind.startsWith("pad") || preset.kind.startsWith("drone") || preset.kind==="tex_stutter_dub"){
+    const xPitch = Math.pow(x, preset.pitchPow ?? 1.8);
+    let freq = preset.base * Math.pow(2, xPitch * (preset.oct ?? 7));
+    if(preset.kind==="drone" || preset.kind.startsWith("drone_")) freq = preset.base;
+
+    if(preset.kind==="stepped"){
+      const s = preset.step.scale;
+      const st = s[Math.min(s.length-1, Math.floor(x * s.length))];
+      const oct = Math.floor(lerp(preset.step.octMin, preset.step.octMax, x));
+      freq = preset.base * Math.pow(2, (oct*12 + st)/12);
+    }
+
+    if(voiceGain){
+      const env = preset.env;
+      if(masterGate.gain.value < 0.02){
+        applyEnv(voiceGain.gain, t, env, 0.9);
+      }else{
+        voiceGain.gain.setTargetAtTime(0.85 * (env.s ?? 1.0), t, 0.10);
+      }
+    }
+
+    if(voice && voice.osc){
+      voice.osc.frequency.setTargetAtTime(clamp(freq, 20, 16000), t, 0.03);
+    }
+    if(voice && voice.car && voice.mod){
+      const c = clamp(freq, 20, 9000);
+      voice.car.frequency.setTargetAtTime(c, t, 0.03);
+      if(preset.fm){
+        const ratio = lerp(preset.fm.ratioA, preset.fm.ratioB, depth);
+        voice.mod.frequency.setTargetAtTime(c*ratio, t, 0.04);
+        voice.modGain.gain.setTargetAtTime(preset.fm.idxMax * depth, t, 0.05);
+      }
+    }
+    if(voice && voice.car && voice.mod && voice.depth && preset.ring){
+      const rf = lerp(preset.ring.min, preset.ring.max, depth);
+      voice.car.frequency.setTargetAtTime(clamp(freq, 20, 12000), t, 0.03);
+      voice.mod.frequency.setTargetAtTime(rf, t, 0.04);
+      voice.depth.gain.setTargetAtTime(preset.ring.depth * depth, t, 0.05);
+    }
+
+    // PRESET 7: chorus “vibration” with rhythmic rate from Y, depth from X
+    if(preset.kind==="drone_ring" && voice && voice.chorus){
+      const ch = preset.chorus;
+      const rate = expMap(1 - y, ch.rateMin, ch.rateMax, 2.2);
+      const dMs  = expMap(x, ch.depthMsMin, ch.depthMsMax, 2.0);
+      voice.chorus.lfo.frequency.setTargetAtTime(rate, t, 0.06);
+      // center delay + LFO depth
+      const center = (dMs / 1000);
+      voice.chorus.chDelay.delayTime.setTargetAtTime(center, t, 0.06);
+      // small modulation around center (keep it stable + musical)
+      const modDepth = clamp((dMs*0.35)/1000, 0.0002, 0.006);
+      voice.chorus.lfoGain.gain.setTargetAtTime(modDepth, t, 0.06);
+    }
+  }
+
+  // PRESET 17: standing tone layer (>= 3000Hz), while held
+  if(preset.kind==="ikeda" && voice && voice.toneOsc && voice.toneGain){
+    const ib = preset.ikeda || {};
+    const f0 = expMap(x, ib.toneMin ?? 3000, ib.toneMax ?? 10000, 1.7);
+    voice.toneOsc.frequency.setTargetAtTime(Math.max(3000, f0), t, 0.05);
+    voice.toneGain.gain.setTargetAtTime(pointer.held ? (0.18 + 0.08*depth) : 0.0, t, 0.02);
+  }
+
+  if(preset.kind==="risset" && voice && voice.voices){
+    const center = expMap(x, 120, 2200, 2.0);
+    const N = preset.ris.voices;
+    const span = preset.ris.spanOct;
+    const spd = preset.ris.speed;
+
+    if(voiceGain){
+      voiceGain.gain.setTargetAtTime(pointer.held ? 0.65 : 0.0, t, 0.10);
+    }
+
+    for(let i=0;i<N;i++){
+      const v = voice.voices[i];
+      const phase = (i / N);
+      const tt = (ac.currentTime * spd + phase) % 1.0;
+      const f = center * Math.pow(2, (tt*span) - span/2);
+      v.o.frequency.setTargetAtTime(clamp(f, 20, 16000), t, 0.06);
+
+      const win = Math.sin(tt*Math.PI);
+      const gain = Math.pow(win, 1.7) * (1.0/N) * lerp(0.35, 1.2, depth);
+      v.og.gain.setTargetAtTime(gain, t, 0.08);
+    }
+  }
+}
+
+/* =========================
+   render loop
+========================= */
+const clock = new THREE.Clock();
+
+function render(){
+  requestAnimationFrame(render);
+  const t = clock.getElapsedTime();
+
+  quad.material.uniforms.time.value = t;
+  quad.material.uniforms.mouse.value.set(pointer.x, 1-pointer.y);
+  quad.material.uniforms.vel.value.set(pointer.vx, pointer.vy);
+
+  if(pointer.started){
+    drawBrushFrame();
+  }
+  quad.material.uniforms.tBrush.value = brushTex;
+
+  quad.material.uniforms.tPrev.value = rtA.texture;
+  renderer.setRenderTarget(rtB);
+  renderer.render(scene, ortho);
+  renderer.setRenderTarget(null);
+
+  quad.material.uniforms.tPrev.value = rtB.texture;
+  renderer.render(scene, ortho);
+
+  const tmp = rtA; rtA = rtB; rtB = tmp;
+
+  tickContinuous(performance.now());
+}
+
+/* =========================
+   preset switching
+========================= */
+function applyPreset(idx){
+  presetIndex = (idx + PRESETS.length) % PRESETS.length;
+  preset = PRESETS[presetIndex];
+  visual = VIS[presetIndex];
+  brushRng = mulberry32(hash32("brush::v5::"+presetIndex));
+  applyVisual();
+  updatePill();
+  if(ac) buildPreset();
+}
+
+function applyRandomPreset(){
+  const rng = mulberry32(hash32("pickrand::v5::" + (Date.now()>>>0)));
+  applyPreset(Math.floor(rng()*PRESETS.length));
+}
+
+/* =========================
+   Start + events
+========================= */
+function firstStart(){
+  if(pointer.started) return;
+  pointer.started = true;
+  hint.style.display = "none";
+  ui.style.display = "flex";
+
+  applyVisual();
+  updatePill();
+
+  startAudio();
+  buildPreset();
+  render();
+}
+
+function armAudio(){
+  audioArmed = true;
+  fadeTriggered = false;
+  if(ac && !muted){
+    const t = ac.currentTime;
+    masterGate.gain.cancelScheduledValues(t);
+    masterGate.gain.setValueAtTime(masterGate.gain.value, t);
+    masterGate.gain.linearRampToValueAtTime(1.0, t + 0.05);
+  }
+}
+
+function disarmAudio(){
+  pointer.held = false;
+}
+
+function onDown(e){
+  updatePointerFromEvent(e);
+  firstStart();
+  pointer.held = true;
+  armAudio();
+
+  if(ac){
+    const needsSched =
+      preset.kind.startsWith("perc_") || preset.kind.startsWith("tex_") ||
+      preset.kind==="ikeda" || preset.kind==="karplus" || preset.kind==="arp";
+
+    if(needsSched){
+      if(sched.timer) clearInterval(sched.timer);
+      sched.nextEventTime = 0;
+      sched.step = 0;
+      sched.timer = setInterval(scheduleLoop, sched.tickMs);
+    }
+  }
+
+  if(ac && voiceGain){
+    const t = ac.currentTime;
+    applyEnv(voiceGain.gain, t, preset.env, 0.9);
+  }
+}
+
+function onUp(){
+  pointer.held = false;
+  if(ac && voiceGain){
+    const t = ac.currentTime;
+    releaseEnv(voiceGain.gain, t, preset.env);
+  }
+}
+
+function onMove(e){
+  if(!pointer.started) return;
+  updatePointerFromEvent(e);
+}
+
+window.addEventListener("pointerdown", onDown);
+window.addEventListener("pointerup", onUp);
+window.addEventListener("pointermove", onMove);
+window.addEventListener("touchstart", (e)=>onDown(e), {passive:true});
+window.addEventListener("touchend", onUp, {passive:true});
+window.addEventListener("touchmove",  (e)=>onMove(e), {passive:true});
+
+/* =========================
+   Buttons
+========================= */
+muteBtn.addEventListener("click", (e)=>{
+  e.stopPropagation();
+  if(!ac) startAudio();
+  setMuted(!muted);
+});
+
+fsBtn.addEventListener("click", async (e)=>{
+  e.stopPropagation();
+  try{
+    if(!document.fullscreenElement) await document.documentElement.requestFullscreen();
+    else await document.exitFullscreen();
+  }catch(_){}
+});
+
+nextBtn.addEventListener("click", (e)=>{
+  e.stopPropagation();
+  applyPreset(presetIndex + 1);
+});
+
+randBtn.addEventListener("click", (e)=>{
+  e.stopPropagation();
+  applyRandomPreset();
+});
+
+applyVisual();
+updatePill();
+</script>
+</body>
+</html>
