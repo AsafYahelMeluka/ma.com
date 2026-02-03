@@ -1,0 +1,1113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Waves</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#000; }
+    canvas { display:block; width:100vw; height:100vh; }
+    #hint{
+      position:fixed; inset:0;
+      display:flex; align-items:center; justify-content:center;
+      font:13px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      color:rgba(255,255,255,0.75);
+      pointer-events:none;
+      z-index:9;
+    }
+    #ui{
+      position:fixed; left:12px; top:12px;
+      display:none; gap:10px; align-items:center;
+      font:12px/1.2 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      color:rgba(255,255,255,0.92);
+      user-select:none;
+      z-index:10;
+      mix-blend-mode:screen;
+    }
+    #ui button{
+      background:rgba(255,255,255,0.10);
+      color:rgba(255,255,255,0.95);
+      border:1px solid rgba(255,255,255,0.20);
+      padding:7px 10px;
+      border-radius:12px;
+      cursor:pointer;
+      backdrop-filter:blur(6px);
+      -webkit-backdrop-filter:blur(6px);
+    }
+    #ui button:hover{ background:rgba(255,255,255,0.18); }
+    #pill{
+      padding:7px 10px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,0.14);
+      background:rgba(0,0,0,0.22);
+      max-width:72vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="hint">Click / tap to start</div>
+  <div id="ui">
+    <button id="muteBtn" type="button">Mute</button>
+    <button id="fsBtn" type="button">Fullscreen</button>
+    <button id="newBtn" type="button">New</button>
+    <span id="pill"></span>
+  </div>
+  <canvas id="view"></canvas>
+
+<script>
+(() => {
+  // ---------------- utils ----------------
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp=(a,b,t)=>a+(b-a)*t;
+
+  // seeded RNG (new each refresh; "New" reseeds)
+  let seed;
+  const sArr=new Uint32Array(1);
+  crypto.getRandomValues(sArr);
+  seed=sArr[0]>>>0;
+  function rnd(){ // xorshift32
+    seed^=seed<<13; seed>>>=0;
+    seed^=seed>>17; seed>>>=0;
+    seed^=seed<<5;  seed>>>=0;
+    return (seed>>>0)/4294967296;
+  }
+  const rndi=(a,b)=>Math.floor(lerp(a,b+1,rnd()));
+  const pick=(arr)=>arr[Math.floor(rnd()*arr.length)];
+  const sign=()=>rnd()<0.5?-1:1;
+
+  // ---------------- canvas ----------------
+  const view=document.getElementById("view");
+  const vctx=view.getContext("2d",{alpha:false});
+
+  // offscreen scene buffer for smooth fade + feedback displacement
+  const scene=document.createElement("canvas");
+  const sctx=scene.getContext("2d",{alpha:true});
+
+  const hint=document.getElementById("hint");
+  const ui=document.getElementById("ui");
+  const pill=document.getElementById("pill");
+  const muteBtn=document.getElementById("muteBtn");
+  const fsBtn=document.getElementById("fsBtn");
+  const newBtn=document.getElementById("newBtn");
+
+  function DPR(){ return Math.max(1,Math.min(2.5,window.devicePixelRatio||1)); }
+  function resize(){
+    const dpr=DPR();
+    const w=Math.floor(innerWidth*dpr);
+    const h=Math.floor(innerHeight*dpr);
+    view.width=w; view.height=h;
+    scene.width=w; scene.height=h;
+    vctx.setTransform(1,0,0,1,0,0);
+    sctx.setTransform(1,0,0,1,0,0);
+  }
+  addEventListener("resize",resize);
+  resize();
+
+  // ---------------- pointer ----------------
+  const pointer={
+    x:innerWidth*0.5, y:innerHeight*0.5,
+    px:null, py:null,
+    vx:0, vy:0,
+    lastMove:performance.now(),
+    started:false
+  };
+  const cssToPxX=(x)=>x*DPR();
+  const cssToPxY=(y)=>y*DPR();
+
+  function getXY(e){
+    if(e.touches&&e.touches[0]) return {x:e.touches[0].clientX,y:e.touches[0].clientY};
+    return {x:e.clientX,y:e.clientY};
+  }
+  function pushPoint(xCss,yCss,now){
+    const x=cssToPxX(xCss), y=cssToPxY(yCss);
+    if(pointer.px!==null){
+      const dt=Math.max(1,now-pointer.lastMove);
+      const vx=(x-pointer.px)/dt;
+      const vy=(y-pointer.py)/dt;
+      pointer.vx=pointer.vx*0.78+vx*0.22;
+      pointer.vy=pointer.vy*0.78+vy*0.22;
+    }
+    pointer.px=x; pointer.py=y;
+    pointer.x=x; pointer.y=y;
+    pointer.lastMove=now;
+  }
+
+  // ---------------- "worlds": 50 distinct presets ----------------
+  const MAX_LAYERS=54; // performance cap
+  const PRESETS=Array.from({length:50},(_,i)=>i);
+
+  let cfg=null;
+
+  function makePreset(id){
+    // VISUAL MODES
+    const drawMode=pick(["lines","dots","mesh","flow"]);
+    const vfx=pick(["none","grain","mirror","kalei","blur","pixelate","chroma"]);
+    const bg=pick(["solid","gradient","neon","duotone","sunset","ocean","acid","paper"]);
+
+    // AUDIO ENGINES (no bitcrush)
+    // basic: single osc (sine/tri/square)
+    // additive: bank of sines
+    // fm: simple FM
+    // ring: ring modulation
+    // seq: simple step sequence (still with waveform choices)
+    const engine=pick(["basic","additive","fm","ring","seq"]);
+
+    const wave = (engine==="additive") ? "sine" : pick(["sine","triangle","square"]);
+
+    const hueA=(rndi(0,359)+id*17)%360;
+    const hueB=(hueA+rndi(60,240))%360;
+
+    return {
+      id,
+      drawMode,
+      vfx,
+      bg,
+      // background & trails
+      fade: lerp(0.006, 0.050, rnd()),      // smaller = longer, smoother fade
+      feedback: lerp(0.955, 0.996, rnd()),  // scene feedback amount
+      smear: lerp(0.0, 1.2, rnd()),         // displacement strength
+      disturb: lerp(0.2, 1.4, rnd()),       // how much new strokes disturb old
+      layers: Math.min(MAX_LAYERS, rndi(14, 58)),
+      lineW: lerp(0.6, 5.8, rnd()),
+      alpha: lerp(0.10, 0.85, rnd()),
+      hueA, hueB,
+      sat: rndi(20,100),
+      light: rndi(35,90),
+      blend: pick(["source-over","screen","lighter","overlay","difference"]),
+      amp: lerp(8, 190, rnd()),
+      frequbat: lerp(0.004, 0.24, rnd()), // base spatial freq
+      phaseInc: lerp(0.01, 0.18, rnd()),
+      lookAheadMs: rndi(50, 420),
+      // background “things” the lines disturb
+      particleN: rndi(120, 520),
+      particleMode: pick(["dots","streaks","mist"]),
+      // vfx params
+      blurPx: lerp(0.0, 10.0, rnd()),
+      pixel: rndi(2, 12),
+      grain: lerp(0.0, 0.12, rnd()),
+      chroma: lerp(0.0, 7.0, rnd()),
+      kaleiSlices: rndi(4, 14),
+
+      // AUDIO config
+      engine,
+      wave,
+      pitchMin: pick([35, 55, 80, 110, 140]),
+      pitchMax: pick([700, 1200, 2500, 5200, 9000, 12000]),
+      // X: pitch mapping curve
+      pitchCurve: pick([0.6, 0.9, 1.2, 1.7, 2.3]),
+      // Y: effects depth mapping
+      fxCurve: pick([0.7, 1.0, 1.4, 2.0]),
+      // delay/reverb ranges (Y controls depth)
+      delayTime: lerp(0.03, 0.45, rnd()),
+      delayFbMax: lerp(0.15, 0.88, rnd()),
+      delayWetMax: lerp(0.05, 0.70, rnd()),
+      revWetMax: lerp(0.00, 0.70, rnd()),
+      revSec: lerp(0.4, 4.2, rnd()),
+      revDecay: lerp(1.2, 8.0, rnd()),
+      // ringmod ranges
+      ringMin: pick([15, 30, 60, 120]),
+      ringMax: pick([200, 400, 900, 1600, 3200]),
+      ringDepthMax: lerp(0.2, 1.0, rnd()),
+      // FM ranges
+      fmRatioMin: pick([0.25, 0.5, 1, 2]),
+      fmRatioMax: pick([2, 4, 8, 12]),
+      fmIndexMax: lerp(20, 900, rnd()), // Y controls
+      // additive config
+      partials: rndi(8, 36),
+      partialSpread: lerp(0.96, 1.12, rnd()), // slightly detune spread
+      // seq config
+      seqLen: pick([5,7,8,9,12,16]),
+      seqRate: lerp(2.0, 10.0, rnd()), // Hz-ish, will be velocity/y-modulated
+      // master loudness (slightly lower than your previous)
+      masterMax: lerp(0.12, 0.22, rnd())
+    };
+  }
+
+  function describeCfg(c){
+    return `seed ${seed} · preset ${c.id} · ${c.bg}/${c.vfx}/${c.drawMode} · ${c.engine}/${c.wave} · layers ${c.layers}`;
+  }
+
+  // ---------------- background + particles ----------------
+  let particles=[];
+  function initParticles(){
+    particles=Array.from({length:cfg.particleN},()=>({
+      x:rnd()*scene.width,
+      y:rnd()*scene.height,
+      vx:(rnd()*2-1)*0.35,
+      vy:(rnd()*2-1)*0.35,
+      s:lerp(0.7,2.6,rnd()),
+      a:lerp(0.03,0.20,rnd())
+    }));
+  }
+
+  function drawBackground(){
+    const w=scene.width, h=scene.height;
+    sctx.globalCompositeOperation="source-over";
+
+    if(cfg.bg==="solid"){
+      sctx.fillStyle=`hsl(${cfg.hueB}, ${Math.min(cfg.sat,60)}%, ${Math.min(cfg.light,20)}%)`;
+      sctx.fillRect(0,0,w,h);
+      return;
+    }
+    if(cfg.bg==="gradient"||cfg.bg==="neon"||cfg.bg==="sunset"||cfg.bg==="ocean"||cfg.bg==="acid"||cfg.bg==="duotone"){
+      const g=sctx.createLinearGradient(0,0,w,h);
+      const a=cfg.hueA, b=cfg.hueB;
+      let l1=10, l2=4, s1=cfg.sat, s2=cfg.sat;
+      if(cfg.bg==="neon"){ l1=24; l2=6; s1=95; s2=90; }
+      if(cfg.bg==="sunset"){ l1=18; l2=3; s1=85; s2=75; }
+      if(cfg.bg==="ocean"){ l1=14; l2=2; s1=70; s2=60; }
+      if(cfg.bg==="acid"){ l1=22; l2=3; s1=100; s2=90; }
+      if(cfg.bg==="duotone"){ l1=12; l2=6; s1=35; s2=35; }
+      g.addColorStop(0, `hsl(${a}, ${s1}%, ${l1}%)`);
+      g.addColorStop(1, `hsl(${b}, ${s2}%, ${l2}%)`);
+      sctx.fillStyle=g;
+      sctx.fillRect(0,0,w,h);
+      return;
+    }
+    if(cfg.bg==="paper"){
+      sctx.fillStyle=`hsl(${cfg.hueB}, 18%, 10%)`;
+      sctx.fillRect(0,0,w,h);
+      // subtle paper grain base
+      const n=Math.floor((w*h)/7000);
+      sctx.fillStyle="rgba(255,255,255,0.025)";
+      for(let i=0;i<n;i++){
+        sctx.fillRect(rnd()*w,rnd()*h,1,1);
+      }
+      return;
+    }
+  }
+
+  function updateParticles(){
+    const w=scene.width, h=scene.height;
+    // let new strokes “disturb” particles: use pointer velocity + cfg.disturb
+    const dv=Math.hypot(pointer.vx, pointer.vy);
+    const kick=clamp(dv*cfg.disturb*0.08, 0, 2.0);
+    const px=pointer.x, py=pointer.y;
+
+    for(const p of particles){
+      // drift
+      p.x += p.vx; p.y += p.vy;
+      if(p.x<0) p.x+=w; if(p.x>w) p.x-=w;
+      if(p.y<0) p.y+=h; if(p.y>h) p.y-=h;
+
+      // disturb near pointer
+      const dx=p.x-px, dy=p.y-py;
+      const d2=dx*dx+dy*dy;
+      if(d2 < 42000){
+        const d=Math.sqrt(d2)+1e-6;
+        const nx=dx/d, ny=dy/d;
+        p.x += nx * kick * 2.2;
+        p.y += ny * kick * 2.2;
+        p.vx += nx * kick * 0.06;
+        p.vy += ny * kick * 0.06;
+      }
+
+      // mild damping
+      p.vx *= 0.995;
+      p.vy *= 0.995;
+    }
+  }
+
+  function drawParticles(){
+    const w=scene.width, h=scene.height;
+    sctx.save();
+    sctx.globalCompositeOperation="screen";
+
+    if(cfg.particleMode==="dots"){
+      sctx.fillStyle=`hsla(${(cfg.hueA+40)%360}, 80%, 70%, 0.08)`;
+      for(const p of particles){
+        sctx.globalAlpha=p.a;
+        sctx.fillRect(p.x,p.y,p.s,p.s);
+      }
+    } else if(cfg.particleMode==="streaks"){
+      sctx.strokeStyle=`hsla(${(cfg.hueA+120)%360}, 90%, 70%, 0.18)`;
+      sctx.lineWidth=1;
+      for(const p of particles){
+        sctx.globalAlpha=p.a;
+        sctx.beginPath();
+        sctx.moveTo(p.x,p.y);
+        sctx.lineTo(p.x-p.vx*22, p.y-p.vy*22);
+        sctx.stroke();
+      }
+    } else { // mist
+      sctx.fillStyle=`hsla(${(cfg.hueB+180)%360}, 60%, 60%, 0.04)`;
+      for(const p of particles){
+        sctx.globalAlpha=p.a*0.9;
+        sctx.beginPath();
+        sctx.arc(p.x,p.y,p.s*2.4,0,Math.PI*2);
+        sctx.fill();
+      }
+    }
+
+    sctx.restore();
+  }
+
+  // ---------------- audio ----------------
+  let ac=null;
+  let master=null, dry=null, wetDelay=null, wetRev=null;
+  let delay=null, fb=null, convolver=null;
+  let filter=null;
+
+  // engines
+  let osc=null;                // basic / fm carrier
+  let modOsc=null;             // fm modulator
+  let ringOsc=null;            // ring modulator
+  let ringGain=null;           // ring depth (mix)
+  let additiveBank=[];         // array of oscillators
+  let seqTimer=null;
+  let seqStep=0;
+  let lastSeqTime=0;
+
+  let muted=false;
+
+  // your rule:
+  // inactivity => 5s fade-out and stays silent until next click
+  let audioArmed=false;
+  let fadeTriggered=false;
+
+  function makeImpulseResponse(ctx, seconds, decay){
+    const rate=ctx.sampleRate;
+    const len=Math.max(1,Math.floor(seconds*rate));
+    const buf=ctx.createBuffer(2,len,rate);
+    for(let ch=0; ch<2; ch++){
+      const d=buf.getChannelData(ch);
+      for(let i=0;i<len;i++){
+        const t=i/len;
+        d[i]=(Math.random()*2-1)*Math.pow(1-t,decay);
+      }
+    }
+    return buf;
+  }
+
+  function stopEngines(){
+    // stop & disconnect safely
+    if(seqTimer){ clearInterval(seqTimer); seqTimer=null; }
+    for(const o of additiveBank){
+      try{o.stop();}catch(_){}
+      try{o.disconnect();}catch(_){}
+    }
+    additiveBank=[];
+
+    for(const node of [ringOsc, ringGain, modOsc, osc]){
+      if(node){
+        try{ node.stop && node.stop(); }catch(_){}
+        try{ node.disconnect(); }catch(_){}
+      }
+    }
+    ringOsc=null; ringGain=null; modOsc=null; osc=null;
+  }
+
+  function startAudio(){
+    if(ac) return;
+    ac=new (window.AudioContext||window.webkitAudioContext)();
+
+    master=ac.createGain();
+    master.gain.value=0.0;
+
+    dry=ac.createGain(); dry.gain.value=1.0;
+    wetDelay=ac.createGain(); wetDelay.gain.value=0.0;
+    wetRev=ac.createGain(); wetRev.gain.value=0.0;
+
+    filter=ac.createBiquadFilter();
+    filter.type="bandpass";
+    filter.frequency.value=800;
+    filter.Q.value=6;
+
+    delay=ac.createDelay(1.0);
+    fb=ac.createGain();
+    convolver=ac.createConvolver();
+
+    // routing: engines -> filter -> dry/delay/rev -> master -> out
+    filter.connect(dry);
+    filter.connect(delay);
+    delay.connect(fb); fb.connect(delay);
+    delay.connect(wetDelay);
+
+    filter.connect(convolver);
+    convolver.connect(wetRev);
+
+    dry.connect(master);
+    wetDelay.connect(master);
+    wetRev.connect(master);
+
+    master.connect(ac.destination);
+  }
+
+  function buildEngine(){
+    if(!ac) return;
+    stopEngines();
+
+    // effect initial values
+    wetDelay.gain.value=0.0;
+    fb.gain.value=0.0;
+    wetRev.gain.value=0.0;
+    delay.delayTime.value=cfg.delayTime;
+
+    convolver.buffer=makeImpulseResponse(ac, cfg.revSec, cfg.revDecay);
+
+    // filter type can vary by preset to make things feel different
+    filter.type=pick(["bandpass","lowpass","highpass"]);
+    filter.Q.value=lerp(0.6, 18.0, rnd());
+
+    // create engine output node
+    const out=ac.createGain();
+    out.gain.value=1.0;
+    out.connect(filter);
+
+    if(cfg.engine==="basic" || cfg.engine==="seq"){
+      osc=ac.createOscillator();
+      osc.type=cfg.wave; // sine/triangle/square
+      osc.frequency.value=220;
+      osc.connect(out);
+      osc.start();
+
+      // seq just gates amplitude periodically later (we do with master/pulse-ish updates)
+      if(cfg.engine==="seq"){
+        seqStep=0;
+        lastSeqTime=performance.now();
+        // Use interval as a simple clock; values updated in audioTick too
+        seqTimer=setInterval(()=>{ seqStep=(seqStep+1)%cfg.seqLen; }, 1000/Math.max(2,cfg.seqRate));
+      }
+    }
+
+    if(cfg.engine==="additive"){
+      // additive synthesis: bank of many sines
+      const N=cfg.partials;
+      const base=220;
+      for(let i=1;i<=N;i++){
+        const o=ac.createOscillator();
+        o.type="sine";
+        // slight detune spread so it feels dense, not identical
+        const spread=cfg.partialSpread;
+        const det=lerp(0.995, 1.005, rnd());
+        o.frequency.value=base*i*spread*det;
+        const g=ac.createGain();
+        // amplitude roll-off
+        g.gain.value=1/Math.pow(i, 1.15);
+        o.connect(g);
+        g.connect(out);
+        o.start();
+        additiveBank.push(o);
+      }
+    }
+
+    if(cfg.engine==="fm"){
+      // FM: carrier osc + mod osc -> frequency
+      osc=ac.createOscillator();
+      modOsc=ac.createOscillator();
+
+      osc.type=cfg.wave; // allow tri/square too
+      modOsc.type="sine";
+
+      const modGain=ac.createGain(); // modulation index
+      modGain.gain.value=0;
+
+      modOsc.connect(modGain);
+      modGain.connect(osc.frequency);
+
+      osc.connect(out);
+
+      osc.frequency.value=220;
+      modOsc.frequency.value=220;
+
+      osc.start(); modOsc.start();
+
+      // store for tick
+      buildEngine.modGain = modGain;
+    }
+
+    if(cfg.engine==="ring"){
+      // Ring modulation: input * modulator (approx using Gain controlled by osc)
+      // We do: carrier -> ringGain -> out, and modulator drives ringGain.gain (bipolar-ish around 0.5)
+      osc=ac.createOscillator();
+      osc.type=cfg.wave;
+
+      ringOsc=ac.createOscillator();
+      ringOsc.type="sine";
+
+      ringGain=ac.createGain();
+      ringGain.gain.value=1.0; // base gain; mod will add variation
+
+      // carrier path
+      osc.connect(ringGain);
+      ringGain.connect(out);
+
+      // modulator shapes gain: (sin + 1)/2 -> 0..1; depth controls how strong it is
+      const shaper=ac.createGain();
+      shaper.gain.value=0.5;            // scale sin
+      ringOsc.connect(shaper);
+
+      const offset=ac.createConstantSource();
+      offset.offset.value=0.5;          // shift to positive
+
+      const depth=ac.createGain();
+      depth.gain.value=0.0;             // set in tick (Y)
+      shaper.connect(depth);
+
+      const sum=ac.createGain();
+      offset.connect(sum);
+      depth.connect(sum);
+
+      sum.connect(ringGain.gain);
+
+      offset.start();
+      osc.start();
+      ringOsc.start();
+
+      // store for tick
+      buildEngine.ringDepth = depth;
+      buildEngine.ringOffset = offset;
+    }
+
+    buildEngine.out = out;
+  }
+
+  function setMuted(next){
+    muted=next;
+    muteBtn.textContent=muted?"Unmute":"Mute";
+    if(!ac) return;
+    const t=ac.currentTime;
+    master.gain.cancelScheduledValues(t);
+    master.gain.setTargetAtTime(muted?0.0:0.001, t, 0.02);
+  }
+
+  muteBtn.addEventListener("click",(e)=>{
+    e.stopPropagation();
+    setMuted(!muted);
+  });
+
+  fsBtn.addEventListener("click", async (e)=>{
+    e.stopPropagation();
+    try{
+      if(!document.fullscreenElement) await document.documentElement.requestFullscreen();
+      else await document.exitFullscreen();
+    }catch(_){}
+  });
+
+  function applyNewWorld(){
+    cfg=makePreset(pick(PRESETS));
+    pill.textContent=describeCfg(cfg);
+    initParticles();
+    if(pointer.started){
+      drawBackground();
+      // clear scene
+      sctx.clearRect(0,0,scene.width,scene.height);
+      // put background onto scene
+      sctx.drawImage(sceneBackground,0,0);
+    }
+    if(ac){
+      buildEngine();
+      // immediate but safe levels
+      const t=ac.currentTime;
+      master.gain.cancelScheduledValues(t);
+      master.gain.setTargetAtTime(muted?0.0:0.001, t, 0.01);
+    }
+  }
+
+  // Background pre-render: we draw into this canvas once per world for strong differences
+  const sceneBackground=document.createElement("canvas");
+  const bctx=sceneBackground.getContext("2d",{alpha:false});
+  function drawBackground(){
+    sceneBackground.width=scene.width;
+    sceneBackground.height=scene.height;
+    bctx.setTransform(1,0,0,1,0,0);
+
+    // reuse drawBackground logic but on bctx
+    const w=sceneBackground.width, h=sceneBackground.height;
+
+    if(cfg.bg==="solid"){
+      bctx.fillStyle=`hsl(${cfg.hueB}, ${Math.min(cfg.sat,70)}%, ${Math.min(cfg.light,18)}%)`;
+      bctx.fillRect(0,0,w,h);
+    } else if(cfg.bg==="paper"){
+      bctx.fillStyle=`hsl(${cfg.hueB}, 18%, 10%)`;
+      bctx.fillRect(0,0,w,h);
+      const n=Math.floor((w*h)/6500);
+      bctx.fillStyle="rgba(255,255,255,0.03)";
+      for(let i=0;i<n;i++) bctx.fillRect(rnd()*w,rnd()*h,1,1);
+    } else {
+      const g=bctx.createLinearGradient(0,0,w,h);
+      let a=cfg.hueA, b=cfg.hueB;
+      let l1=10,l2=4,s1=cfg.sat,s2=cfg.sat;
+      if(cfg.bg==="neon"){ l1=26; l2=6; s1=95; s2=90; }
+      if(cfg.bg==="sunset"){ l1=18; l2=4; s1=85; s2=78; }
+      if(cfg.bg==="ocean"){ l1=14; l2=3; s1=70; s2=60; }
+      if(cfg.bg==="acid"){ l1=24; l2=3; s1=100; s2=90; }
+      if(cfg.bg==="duotone"){ l1=12; l2=7; s1=35; s2=35; }
+      g.addColorStop(0,`hsl(${a},${s1}%,${l1}%)`);
+      g.addColorStop(1,`hsl(${b},${s2}%,${l2}%)`);
+      bctx.fillStyle=g;
+      bctx.fillRect(0,0,w,h);
+    }
+  }
+
+  newBtn.addEventListener("click",(e)=>{
+    e.stopPropagation();
+    // reseed hard so it really changes
+    seed = (seed + (Math.random()*1e9|0)) >>> 0;
+    applyNewWorld();
+  });
+
+  // ---------------- start / events ----------------
+  function firstStart(){
+    if(pointer.started) return;
+    pointer.started=true;
+    hint.style.display="none";
+    ui.style.display="flex";
+    applyNewWorld();
+    // init scene with background
+    sctx.clearRect(0,0,scene.width,scene.height);
+    sctx.drawImage(sceneBackground,0,0);
+  }
+
+  function onDown(e){
+    const now=performance.now();
+    const p=getXY(e);
+    pushPoint(p.x,p.y,now);
+
+    firstStart();
+    startAudio();
+    if(!ac) return;
+    if(!buildEngine.out) buildEngine();
+    // user rule: audio returns ONLY on click
+    audioArmed=true;
+    fadeTriggered=false;
+
+    const t=ac.currentTime;
+    master.gain.cancelScheduledValues(t);
+    master.gain.setTargetAtTime(muted?0.0:0.05, t, 0.03);
+  }
+  function onMove(e){
+    const now=performance.now();
+    const p=getXY(e);
+    pushPoint(p.x,p.y,now);
+  }
+  addEventListener("pointerdown",onDown);
+  addEventListener("pointermove",onMove);
+  addEventListener("touchstart",(e)=>onDown(e),{passive:true});
+  addEventListener("touchmove",(e)=>onMove(e),{passive:true});
+
+  // ---------------- Visual effects (post) ----------------
+  function applyVFX(){
+    const w=view.width, h=view.height;
+
+    // baseline: copy scene to view with optional filters
+    vctx.save();
+    vctx.setTransform(1,0,0,1,0,0);
+    vctx.globalCompositeOperation="source-over";
+    vctx.filter="none";
+
+    if(cfg.vfx==="blur"){
+      vctx.filter=`blur(${cfg.blurPx.toFixed(1)}px)`;
+      vctx.drawImage(scene,0,0);
+    } else if(cfg.vfx==="pixelate"){
+      // cheap pixelate: downsample then upsample
+      const s=cfg.pixel;
+      const pw=Math.max(1,Math.floor(w/(s*6)));
+      const ph=Math.max(1,Math.floor(h/(s*6)));
+      // create temp small canvas by drawing scene scaled down
+      const tmp=document.createElement("canvas");
+      tmp.width=pw; tmp.height=ph;
+      const tctx=tmp.getContext("2d");
+      tctx.imageSmoothingEnabled=false;
+      tctx.drawImage(scene,0,0,pw,ph);
+      vctx.imageSmoothingEnabled=false;
+      vctx.drawImage(tmp,0,0,pw,ph, 0,0,w,h);
+      vctx.imageSmoothingEnabled=true;
+    } else if(cfg.vfx==="mirror"){
+      // mirror horizontally
+      vctx.drawImage(scene,0,0);
+      vctx.save();
+      vctx.translate(w,0);
+      vctx.scale(-1,1);
+      vctx.globalAlpha=0.75;
+      vctx.drawImage(scene,0,0);
+      vctx.restore();
+    } else if(cfg.vfx==="kalei"){
+      // simple kalei-ish: draw rotated wedges around center
+      const slices=cfg.kaleiSlices;
+      const cx=w/2, cy=h/2;
+      vctx.translate(cx,cy);
+      for(let i=0;i<slices;i++){
+        vctx.save();
+        vctx.rotate((i*2*Math.PI)/slices);
+        vctx.scale(i%2? -1:1, 1);
+        vctx.globalAlpha=0.85;
+        vctx.drawImage(scene,-cx,-cy);
+        vctx.restore();
+      }
+    } else if(cfg.vfx==="chroma"){
+      // chromatic offset (RGB split approximation)
+      const off=cfg.chroma;
+      vctx.globalCompositeOperation="source-over";
+      vctx.drawImage(scene,0,0);
+
+      vctx.globalCompositeOperation="screen";
+      vctx.globalAlpha=0.55;
+      vctx.drawImage(scene, off, 0);
+      vctx.drawImage(scene, -off, 0);
+      vctx.globalAlpha=1.0;
+      vctx.globalCompositeOperation="source-over";
+    } else {
+      vctx.drawImage(scene,0,0);
+    }
+
+    // grain overlay
+    if(cfg.vfx==="grain" || cfg.grain>0.0001){
+      const n=Math.floor((w*h)/9000);
+      vctx.fillStyle=`rgba(255,255,255,${cfg.grain.toFixed(3)})`;
+      for(let i=0;i<n;i++){
+        vctx.fillRect(rnd()*w, rnd()*h, 1, 1);
+      }
+    }
+
+    vctx.restore();
+  }
+
+  // ---------------- Draw modes ----------------
+  let phase=rnd()*Math.PI*2;
+
+  function drawStroke(){
+    const w=scene.width, h=scene.height;
+
+    // velocity & normalized axes
+    const vx=pointer.vx, vy=pointer.vy;
+    const speed=Math.hypot(vx,vy);
+    const s=clamp(speed*10.0, 0, 1);
+
+    // style
+    sctx.globalCompositeOperation=cfg.blend;
+    sctx.lineWidth=cfg.lineW;
+
+    // pick stroke color
+    const col = `hsla(${cfg.hueA}, ${cfg.sat}%, ${cfg.light}%, ${cfg.alpha})`;
+    const col2= `hsla(${cfg.hueB}, ${cfg.sat}%, ${cfg.light}%, ${cfg.alpha})`;
+    sctx.strokeStyle=(rnd()<0.5)?col:col2;
+    sctx.fillStyle=sctx.strokeStyle;
+
+    const layers=cfg.layers;
+    const ampBase=cfg.amp * lerp(0.45, 1.8, s);
+    const freq=cfg.RubAt * lerp(0.7, 1.4, s);
+
+    // normal vector from velocity (fallback)
+    const len=Math.hypot(vx,vy) || 1;
+    const nx=-vy/len, ny=vx/len;
+
+    if(cfg.drawMode==="lines" || cfg.drawMode==="flow"){
+      for(let li=0; li<layers; li++){
+        const spread = lerp(2.0, 18.0, s) * (li/layers);
+        const off=(li-(layers-1)/2) * spread * 0.18;
+
+        sctx.beginPath();
+        // a local polyline around pointer, smoother than “segments”
+        const steps = 38;
+        for(let i=0;i<=steps;i++){
+          const t=i/steps;
+          const back = t*lerp(30, 240, 1-s);
+          const px = pointer.x - vx*back;
+          const py = pointer.y - vy*back;
+
+          // wave around the normal
+          const wob =
+            Math.sin((i*6.2)*freq + phase + li*0.11) * (ampBase*(1-t)) +
+            Math.sin((i*2.1)*(freq*1.6) + phase*0.7 + li*0.05) * (ampBase*0.25*(1-t)) +
+            off;
+
+          const x = px + nx*wob;
+          const y = py + ny*wob;
+
+          if(i===0) sctx.moveTo(x,y); else sctx.lineTo(x,y);
+        }
+        sctx.stroke();
+
+        // "flow" adds small beads
+        if(cfg.drawMode==="flow" && rnd()<0.25){
+          sctx.globalAlpha=cfg.alpha*0.7;
+          sctx.beginPath();
+          sctx.arc(pointer.x + nx*off, pointer.y + ny*off, lerp(0.8, 3.0, s), 0, Math.PI*2);
+          sctx.fill();
+          sctx.globalAlpha=1.0;
+        }
+      }
+    } else if(cfg.drawMode==="dots"){
+      const dots = Math.floor(lerp(20, 220, s));
+      for(let i=0;i<dots;i++){
+        const a=rnd()*Math.PI*2;
+        const r= Math.pow(rnd(), 0.35) * lerp(6, 220, s);
+        const x=pointer.x + Math.cos(a)*r;
+        const y=pointer.y + Math.sin(a)*r;
+        const rr=lerp(0.7, 5.0, rnd()) * (0.5 + s);
+        sctx.globalAlpha=cfg.alpha * lerp(0.12, 0.9, rnd());
+        sctx.beginPath();
+        sctx.arc(x,y,rr,0,Math.PI*2);
+        sctx.fill();
+      }
+      sctx.globalAlpha=1.0;
+    } else { // mesh
+      const grid = Math.floor(lerp(8, 22, s));
+      const size = lerp(18, 70, s);
+      sctx.lineWidth=lerp(0.6, 2.0, s);
+      for(let gx=-grid; gx<=grid; gx++){
+        for(let gy=-grid; gy<=grid; gy++){
+          const x = pointer.x + gx*size + Math.sin(phase + gx*0.7 + gy*0.4)*ampBase*0.08;
+          const y = pointer.y + gy*size + Math.cos(phase*0.9 + gx*0.3 - gy*0.6)*ampBase*0.08;
+          if(rnd()<0.15){
+            sctx.globalAlpha=cfg.alpha*0.5;
+            sctx.beginPath();
+            sctx.arc(x,y,lerp(0.4,2.2,rnd())*(1+s),0,Math.PI*2);
+            sctx.fill();
+          } else {
+            // connect to neighbor
+            const x2 = x + size;
+            const y2 = y;
+            sctx.globalAlpha=cfg.alpha*0.35;
+            sctx.beginPath();
+            sctx.moveTo(x,y);
+            sctx.lineTo(x2,y2);
+            sctx.stroke();
+          }
+        }
+      }
+      sctx.globalAlpha=1.0;
+    }
+
+    sctx.globalCompositeOperation="source-over";
+  }
+
+  // ---------------- feedback + smooth fade ----------------
+  function updateScene(now){
+    const w=scene.width, h=scene.height;
+
+    // 1) copy old scene with slight displacement so "new lines push old lines"
+    const dx = pointer.vx * cfg.smear * 8.0;
+    const dy = pointer.vy * cfg.smear * 8.0;
+
+    sctx.save();
+    sctx.setTransform(1,0,0,1,0,0);
+    sctx.globalCompositeOperation="source-over";
+
+    // soft fade: draw background with low alpha instead of hard clear
+    sctx.globalAlpha = cfg.fade;
+    sctx.drawImage(sceneBackground,0,0);
+
+    // feedback copy (disturb)
+    sctx.globalAlpha = cfg.feedback;
+    sctx.drawImage(scene, dx, dy);
+
+    sctx.restore();
+
+    // 2) update/draw particles behind strokes, then draw strokes
+    updateParticles();
+    drawParticles();
+
+    drawStroke();
+  }
+
+  // ---------------- audio tick (X->pitch, Y->fx depth) ----------------
+  function audioTick(now){
+    if(!ac || muted) return;
+
+    const inactiveMs=now-pointer.lastMove;
+
+    // fade out after inactivity; stay disarmed until click
+    if(audioArmed && inactiveMs>140){
+      if(!fadeTriggered){
+        fadeTriggered=true;
+        const t=ac.currentTime;
+        master.gain.cancelScheduledValues(t);
+        master.gain.setValueAtTime(master.gain.value, t);
+        master.gain.linearRampToValueAtTime(0.0, t+5.0);
+        audioArmed=false;
+      }
+      return;
+    }
+    if(!audioArmed) return;
+
+    const w=scene.width, h=scene.height;
+
+    // prediction point
+    const fx = pointer.x + pointer.vx * cfg.lookAheadMs;
+    const fy = pointer.y + pointer.vy * cfg.lookAheadMs;
+
+    // X & Y normalized (0..1)
+    const xN = clamp(fx / w, 0, 1);
+    const yN = clamp(fy / h, 0, 1);
+
+    // X -> pitch (clear mapping)
+    const xCurve = Math.pow(xN, cfg.pitchCurve);
+    const fBase = lerp(cfg.pitchMin, cfg.pitchMax, xCurve);
+
+    // Y -> fx depth (clear mapping)
+    const yCurve = Math.pow(1 - yN, cfg.fxCurve); // top = more effects
+    const fxDepth = clamp(yCurve, 0, 1);
+
+    // speed -> loudness "energy"
+    const speed = Math.hypot(pointer.vx, pointer.vy);
+    const s = clamp(speed*10.0, 0, 1);
+
+    const t = ac.currentTime;
+
+    // set master (slightly lower than earlier, but still present)
+    const g = clamp(lerp(0.05, cfg.masterMax, s), 0.02, 0.30);
+    master.gain.setTargetAtTime(g, t, 0.05);
+
+    // effects depth from Y
+    wetDelay.gain.setTargetAtTime(cfg.delayWetMax * fxDepth, t, 0.08);
+    fb.gain.setTargetAtTime(cfg.delayFbMax * fxDepth, t, 0.08);
+    wetRev.gain.setTargetAtTime(cfg.revWetMax * fxDepth, t, 0.12);
+
+    // filter follows Y too for obvious change
+    const cut = lerp(200, 12000, fxDepth);
+    filter.frequency.setTargetAtTime(cut, t, 0.06);
+
+    // engine-specific mapping
+    if(cfg.engine==="basic" || cfg.engine==="seq"){
+      if(osc){
+        // seq: quantized steps sometimes (more contrast)
+        let f = fBase;
+        if(cfg.engine==="seq"){
+          const scale = [0,2,3,5,7,8,10]; // minor-ish
+          const oct = Math.floor(lerp(-1, 2, xN));
+          const st = scale[(seqStep + Math.floor(xN*7)) % scale.length];
+          const m = (oct*12 + st);
+          // map around a base note derived from pitchMin
+          const baseHz = Math.max(30, cfg.pitchMin);
+          f = baseHz * Math.pow(2, m/12);
+          // also mod sequence rate with Y and speed (so it varies)
+          const rate = lerp(1.5, cfg.seqRate, fxDepth) * lerp(0.7, 1.6, s);
+          if(seqTimer){
+            clearInterval(seqTimer);
+            seqTimer=setInterval(()=>{ seqStep=(seqStep+1)%cfg.seqLen; }, 1000/Math.max(1.5,rate));
+          }
+        }
+        osc.frequency.setTargetAtTime(clamp(f,20,16000), t, 0.03);
+      }
+    }
+
+    if(cfg.engine==="additive"){
+      // additive: base moves with X, Y slightly “brightens” by tilting partial gains via filter & base
+      const base = clamp(fBase, 20, 1200);
+      let i=1;
+      for(const o of additiveBank){
+        // keep harmonic-ish but with slight random spread stable per world
+        o.frequency.setTargetAtTime(base*i, t, 0.06);
+        i++;
+      }
+    }
+
+    if(cfg.engine==="fm"){
+      if(osc && modOsc && buildEngine.modGain){
+        // X: carrier pitch, Y: FM index, also set mod ratio range by Y (big change)
+        const ratio = lerp(cfg.fmRatioMin, cfg.fmRatioMax, fxDepth);
+        const c = clamp(fBase, 20, 8000);
+        const m = clamp(c * ratio, 1, 16000);
+        osc.frequency.setTargetAtTime(c, t, 0.03);
+        modOsc.frequency.setTargetAtTime(m, t, 0.05);
+
+        const idx = cfg.fmIndexMax * fxDepth * lerp(0.2, 1.0, s);
+        buildEngine.modGain.gain.setTargetAtTime(idx, t, 0.06);
+      }
+    }
+
+    if(cfg.engine==="ring"){
+      if(osc && ringOsc && buildEngine.ringDepth){
+        // X: carrier pitch, Y: ring depth + ring freq
+        const c = clamp(fBase, 20, 12000);
+        osc.frequency.setTargetAtTime(c, t, 0.03);
+
+        const rf = lerp(cfg.ringMin, cfg.ringMax, fxDepth);
+        ringOsc.frequency.setTargetAtTime(rf, t, 0.05);
+
+        buildEngine.ringDepth.gain.setTargetAtTime(cfg.ringDepthMax * fxDepth, t, 0.06);
+      }
+    }
+  }
+
+  // ---------------- main loop ----------------
+  function frame(now){
+    if(!pointer.started){
+      requestAnimationFrame(frame);
+      return;
+    }
+    updateScene(now);
+    applyVFX();
+    audioTick(now);
+    requestAnimationFrame(frame);
+  }
+
+  // ---------------- init world + engine ----------------
+  function applyWorld(){
+    cfg=makePreset(pick(PRESETS));
+    pill.textContent=describeCfg(cfg);
+    drawBackground();
+    initParticles();
+
+    // reset scene buffer
+    sctx.clearRect(0,0,scene.width,scene.height);
+    sctx.drawImage(sceneBackground,0,0);
+
+    if(ac){
+      buildEngine();
+    }
+  }
+
+  // ---------------- start behavior ----------------
+  function onDown(e){
+    const now=performance.now();
+    const p=getXY(e);
+    pushPoint(p.x,p.y,now);
+
+    if(!pointer.started){
+      pointer.started=true;
+      hint.style.display="none";
+      ui.style.display="flex";
+      applyWorld();
+      requestAnimationFrame(frame);
+    }
+
+    startAudio();
+    if(!ac) return;
+    buildEngine();
+
+    // disarm logic reset
+    audioArmed=true;
+    fadeTriggered=false;
+
+    // ramp in a bit
+    const t=ac.currentTime;
+    master.gain.cancelScheduledValues(t);
+    master.gain.setTargetAtTime(muted?0.0:0.05, t, 0.03);
+  }
+
+  function onMove(e){
+    const now=performance.now();
+    const p=getXY(e);
+    pushPoint(p.x,p.y,now);
+  }
+
+  addEventListener("pointerdown", onDown);
+  addEventListener("pointermove", onMove);
+  addEventListener("touchstart", (e)=>onDown(e), {passive:true});
+  addEventListener("touchmove", (e)=>onMove(e), {passive:true});
+
+  // UI
+  muteBtn.addEventListener("click",(e)=>{ e.stopPropagation(); setMuted(!muted); });
+  fsBtn.addEventListener("click", async (e)=>{
+    e.stopPropagation();
+    try{
+      if(!document.fullscreenElement) await document.documentElement.requestFullscreen();
+      else await document.exitFullscreen();
+    }catch(_){}
+  });
+  newBtn.addEventListener("click",(e)=>{
+    e.stopPropagation();
+    // hard reseed + new world (much more contrast than just changing params)
+    seed = (seed + (Math.random()*1e9|0)) >>> 0;
+    applyWorld();
+  });
+
+  // Before first click: nothing is rendered (black). That's on purpose.
+
+})();
+</script>
+</body>
+</html>
